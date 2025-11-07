@@ -57,5 +57,8 @@ jobs:
           TWITTER_API_SECRET: ${{ secrets.X_API_SECRET_CEO }}
           TWITTER_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN_CEO }}
           TWITTER_ACCESS_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET_CEO }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          DAILY_TOKEN_BUDGET_USD: 0.50
+          REPLIES_SINGLE_VARIANT: true
         run: |
           python coach.py --task "${{ steps.pick.outputs.task }}"

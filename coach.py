@@ -428,26 +428,67 @@ def _parse_selection(text: str) -> list[int]:
     return [int(x) for x in m]
 
 
-def _generate_reply_variants(tweet_text: str, username: str) -> tuple[str, str]:
+def _generate_reply_single(tweet_text: str, username: str, tone: str = "safe") -> str:
+    """Generate a single reply (safe by default). tone in {"safe","spicy"}."""
+    instr = (
+        "Draft ONE concise Twitter reply (max 280 chars) to the tweet below."
+        " Write in my voice: practical, specific, respectful."
+    )
+    if tone == "spicy":
+        instr = (
+            "Draft ONE concise Twitter reply (max 280 chars). Tone: spicy/contrarian but respectful."
+            " Avoid fluff; make a sharp point."
+        )
     prompt = (
-        "You are an expert social media strategist. Draft two concise reply variants to the tweet below.\n"
-        "Variant 1: safe/professional. Variant 2: spicy/edgy but respectful.\n"
-        "Tweet by @" + username + ":\n" + tweet_text + "\n"
-        "Output format:\n1) <safe>\n2) <spicy>\n"
+        instr + "\nTweet by @" + username + ":\n" + tweet_text + "\nReturn only the reply text."
     )
     text = _anthropic_complete(prompt, task="replies")
-    # naive parse: split on lines starting with 1) and 2)
-    v1, v2 = None, None
+    # Take first non-empty line
     for ln in text.splitlines():
-        if ln.strip().startswith("1)"):
-            v1 = ln.split("1)", 1)[1].strip()
-        elif ln.strip().startswith("2)"):
-            v2 = ln.split("2)", 1)[1].strip()
-    if not v1 or not v2:
-        parts = text.split("\n", 1)
-        v1 = (parts[0] if parts else text)[:280]
-        v2 = (parts[1] if len(parts) > 1 else text)[:280]
-    return v1[:280], v2[:280]
+        if ln.strip():
+            return ln.strip()[:280]
+    return text.strip()[:280]
+
+
+def _load_budget_state() -> dict:
+    # Persist very small state in data/state.json (ignored from git)
+    root = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.abspath(os.path.join(root, "..", "..", "data"))
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, "state.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_budget_state(s: dict) -> None:
+    root = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.abspath(os.path.join(root, "..", "..", "data"))
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, "state.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(s, f)
+
+
+def _budget_allow(cost: float) -> bool:
+    budget = float(os.getenv("DAILY_TOKEN_BUDGET_USD", "0.50"))
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    s = _load_budget_state()
+    if s.get("date") != today:
+        s = {"date": today, "spend": 0.0, "drafts": 0}
+    if s["spend"] + cost > budget:
+        _save_budget_state(s)
+        return False
+    s["spend"] += cost
+    s["drafts"] += 1
+    _save_budget_state(s)
+    return True
+
+
+_SINGLE_VARIANT = os.getenv("REPLIES_SINGLE_VARIANT", "true").lower() == "true"
+_COST_PER_DRAFT = float(os.getenv("ESTIMATED_COST_PER_DRAFT_USD", "0.04"))
 
 
 def run_opportunity_scan() -> None:
@@ -463,10 +504,13 @@ def run_opportunity_scan() -> None:
     # Stage 2 trigger: check for selection replies under header
     replies = slack_thread_replies(channel, header_ts, limit=100)
     selected: list[int] = []
+    want_spicy = False
     for r in replies:
-        txt = (r.get("text") or "").lower()
-        if "create" in txt or any(ch.isdigit() for ch in txt):
-            selected = _parse_selection(txt)
+        txt_low = (r.get("text") or "").lower()
+        if "create" in txt_low or any(ch.isdigit() for ch in txt_low):
+            selected = _parse_selection(txt_low)
+            if "spicy" in txt_low:
+                want_spicy = True
             break
     if not selected:
         return  # wait for user selection next run
@@ -476,24 +520,28 @@ def run_opportunity_scan() -> None:
         o = by_idx.get(idx)
         if not o:
             continue
+        # Budget check before generating
+        if not _budget_allow(_COST_PER_DRAFT):
+            slack_post(
+                channel,
+                f"{COACH_TAG} Budget reached; drafts paused for today.",
+                thread_ts=header_ts,
+            )
+            return
         # Get tweet text for generation
         client = twitter_client_v2()
         tw = client.get_tweet(id=o.tweet_id, tweet_fields=["text"]).data
         tweet_text = getattr(tw, "text", o.summary)
-        v1, v2 = _generate_reply_variants(tweet_text, o.user)
-        # Post variants in the same thread, each with option emoji
-        _, m1ts = slack_post(
+        tone = "spicy" if want_spicy else "safe"
+        reply = _generate_reply_single(tweet_text, o.user, tone=tone)
+        # Post single draft in thread; 👍 to post
+        slack_post(
             channel,
-            f"{COACH_TAG} Reply {idx} VAR 1️⃣ (tweet_id={o.tweet_id}):\n{v1}",
-            thread_ts=header_ts,
-        )
-        _, m2ts = slack_post(
-            channel,
-            f"{COACH_TAG} Reply {idx} VAR 2️⃣ (tweet_id={o.tweet_id}):\n{v2}",
+            f"{COACH_TAG} Reply {idx} (tweet_id={o.tweet_id}):\n{reply}",
             thread_ts=header_ts,
         )
 
-    # Reaction-based posting for variants
+    # Reaction-based posting for single drafts (👍)
     replies = slack_thread_replies(channel, header_ts, limit=200)
     for r in replies:
         txt = r.get("text") or ""
@@ -503,24 +551,7 @@ def run_opportunity_scan() -> None:
         reactions = {rv.get("name"): rv.get("count", 0) for rv in r.get("reactions", [])}
         if reactions.get(ROBOT_REACTION, 0) > 0:
             continue
-        target = None
-        if (
-            reactions.get("one", 0) > 0
-            or reactions.get("1", 0) > 0
-            or reactions.get("one", 0) > 0
-            or reactions.get("keycap_1", 0) > 0
-        ):
-            target = txt
-        if (
-            reactions.get("two", 0) > 0
-            or reactions.get("2", 0) > 0
-            or reactions.get("keycap_2", 0) > 0
-        ):
-            target = txt
-        if not target:
-            # Also consider unicode 1️⃣ and 2️⃣ names from Slack as "one"/"two"
-            pass
-        if target:
+        if reactions.get("+1", 0) > 0 or reactions.get("thumbsup", 0) > 0:
             # Extract tweet_id
             tid = None
             for part in txt.split():
