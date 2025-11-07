@@ -12,9 +12,13 @@ Commands
   - pip install -U pip
   - pip install -r requirements.txt -r requirements-dev.txt
   - pre-commit install
-- Run the API (from repo root)
-  - uvicorn spark_coach.app:app --reload
-- Run tests
+- Script runs
+  - Suggest + monitor: python coach.py --task suggest
+  - Afternoon prompts: python coach.py --task afternoon
+  - Opportunity scan: python coach.py --task scan
+  - Daily summary: python coach.py --task summary
+  - Weekly brief: python coach.py --task weekly
+- Tests
   - PYTHONPATH=src pytest
   - Single test: PYTHONPATH=src pytest tests/test_health.py::test_health_ok
 - Lint and format
@@ -24,11 +28,10 @@ Commands
 - Typecheck
   - mypy src
 - Environment
-  - Required for Slack webhooks: export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
-- Manual Slack test
-  - curl -X POST http://127.0.0.1:8000/v1/slack/notify -H 'Content-Type: application/json' -d '{"text":"Hello from spark-coach"}'
+  - Required: export ANTHROPIC_API_KEY=..., SLACK_BOT_TOKEN=..., SLACK_CHANNEL_ID=...
+  - Required for X posting: export TWITTER_API_KEY=..., TWITTER_API_SECRET=..., TWITTER_ACCESS_TOKEN=..., TWITTER_ACCESS_SECRET=...
 
-Architecture (high-level)
+Shortcuts (Makefile)
 - make venv && make deps
 - make run
 - make test
@@ -36,12 +39,29 @@ Architecture (high-level)
 - make fmt / make fmt-check
 - make typecheck
 
+Automation (GitHub Actions)
+- coach.yml runs every 30 minutes (UTC). The job selects tasks:
+  - 07:30 UTC (08:30 CET): suggest
+  - 13:00 UTC (14:00 CET): afternoon
+  - 17:00 UTC (18:00 CET): summary
+  - Sunday 19:00 UTC (20:00 CET): weekly
+  - Otherwise: scan
+- Secrets to set in repo settings:
+  - ANTHROPIC_API_KEY
+  - SLACK_BOT_TOKEN
+  - SLACK_CHANNEL_ID
+  - TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
+- Manual dispatch supported (workflow_dispatch)
+
+Manual runs
+- Suggest + monitor: python coach.py --task suggest
+- Summary (evening): python coach.py --task summary
+
 Architecture (high-level)
-- Backend: FastAPI app with entrypoint at spark_coach.app:app
-  - Health endpoint at GET /health returning {"status": "ok"}
-- Layout
-  - Application code lives under src/spark_coach/
-  - Tests under tests/ (pytest configured via pyproject.toml)
+- Simple automation oriented around a single script: coach.py
+  - Tasks: suggest (morning content), afternoon (build-in-public), scan (opportunity radar), replies/recs (reply engine and follow/DM), summary (daily), weekly (Sunday)
+  - Slack-driven control via reactions (👍 to auto-post); no web server
+- Optional dev code under src/ and tests/ remains for future API needs (can be ignored)
 - Tooling
   - Tool configs in pyproject.toml (black, ruff, mypy, pytest)
   - Dependencies in requirements.txt and requirements-dev.txt
