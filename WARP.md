@@ -29,6 +29,7 @@ Commands
   - mypy src
 - Environment
   - Required: export ANTHROPIC_API_KEY=..., SLACK_BOT_TOKEN=..., SLACK_CHANNEL_ID=...
+  - Optional: export ANTHROPIC_MODEL=... (e.g., claude-3-5-sonnet-20241022 for production content)
   - Required for X posting: export TWITTER_API_KEY=..., TWITTER_API_SECRET=..., TWITTER_ACCESS_TOKEN=..., TWITTER_ACCESS_SECRET=...
 
 Shortcuts (Makefile)
