@@ -47,14 +47,34 @@ def generate_suggestions() -> str:
         "Generate 3 high-signal tweets I should post today and 3 reply opportunities "
         "(account mentions + suggested reply). Output as a concise list with bullets."
     )
-    msg = client.messages.create(
-        model="claude-3-5-sonnet-latest",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}],
-    )
+
+    # Try a few model aliases to be resilient across API updates
+    candidate_models = [
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-latest",
+        "claude-3-opus-latest",
+        "claude-3-5-haiku-20241022",
+        "claude-3-haiku-20240307",
+    ]
+    last_err: Exception | None = None
+    msg = None
+    for model in candidate_models:
+        try:
+            msg = client.messages.create(
+                model=model,
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            break
+        except Exception as e:  # NotFoundError or similar
+            last_err = e
+            continue
+    if msg is None and last_err is not None:
+        raise last_err
+
     # anthropic python SDK returns content as list of blocks; take plain text
-    content_parts = []
-    for part in msg.content:
+    content_parts: list[str] = []
+    for part in msg.content:  # type: ignore[union-attr]
         # each part may be TextBlock
         text = getattr(part, "text", None) or getattr(part, "content", None)
         if isinstance(text, str):
