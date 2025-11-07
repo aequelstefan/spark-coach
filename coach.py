@@ -108,11 +108,11 @@ def slack_client() -> WebClient:
     return WebClient(token=env_required("SLACK_BOT_TOKEN"))
 
 
-def slack_post(channel: str, text: str) -> tuple[str, str]:
+def slack_post(channel: str, text: str, *, thread_ts: str | None = None) -> tuple[str, str]:
     """Post a message; returns (channel, ts)."""
     client = slack_client()
     try:
-        resp = client.chat_postMessage(channel=channel, text=text)
+        resp = client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
         return resp["channel"], resp["ts"]
     except SlackApiError as e:
         raise RuntimeError(f"Slack post failed: {e.response['error']}") from e
@@ -127,6 +127,16 @@ def slack_history(channel: str, oldest_ts: float | None = None, limit: int = 100
     client = slack_client()
     resp = client.conversations_history(channel=channel, limit=limit, oldest=oldest_ts)
     return list(resp.get("messages", []))
+
+
+def slack_thread_replies(channel: str, thread_ts: str, limit: int = 100) -> list[dict]:
+    client = slack_client()
+    resp = client.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
+    # First element is the parent; include replies only
+    msgs = list(resp.get("messages", []))
+    if msgs and msgs[0].get("ts") == thread_ts:
+        return msgs[1:]
+    return msgs
 
 
 # ---- X (Twitter) ----
@@ -159,55 +169,91 @@ def monitor_creator_map() -> list[str]:
 # ---- Main flows ----
 
 
+def _extract_tweets_from_suggestions(s: str) -> list[str]:
+    lines = [ln.rstrip() for ln in s.splitlines()]
+    tweets: list[str] = []
+    in_tweets = False
+    for ln in lines:
+        if ln.strip().lower().startswith("tweets"):
+            in_tweets = True
+            continue
+        if in_tweets and ln.strip().lower().startswith("reply"):
+            break
+        if in_tweets and ln.strip().startswith(("-", "•")):
+            stripped = ln.lstrip("- ").lstrip("• ").strip()
+            if stripped:
+                tweets.append(stripped)
+    # Fallback: if none parsed, take first three bullet-like lines anywhere
+    if not tweets:
+        for ln in lines:
+            if ln.strip().startswith(("-", "•")):
+                stripped = ln.lstrip("- ").lstrip("• ").strip()
+                if stripped:
+                    tweets.append(stripped)
+            if len(tweets) >= 3:
+                break
+    return tweets[:5]
+
+
 def run_suggest_and_monitor() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
 
     today = dt.datetime.now(TZ).strftime("%Y-%m-%d")
     suggestions = generate_suggestions()
-    header = f"{COACH_TAG} Suggestions for {today}\nReact with :+1: to auto-post"
-    text = f"{header}\n\n{suggestions}"
+    tweets = _extract_tweets_from_suggestions(suggestions)
 
-    ch, ts = slack_post(channel, text)
-    print(f"Posted suggestions to Slack at ts={ts}")
+    header = f"{COACH_TAG} Suggestions for {today}"
+    ch, header_ts = slack_post(
+        channel, f"{header}\nReply Opportunities below; react on a tweet to auto-post"
+    )
+
+    # Post each tweet as a thread reply so a 👍 applies to that specific option
+    for idx, tw in enumerate(tweets, start=1):
+        slack_post(
+            channel,
+            f"{COACH_TAG} Tweet {idx}: {tw}\nReact with :+1: to auto-post",
+            thread_ts=header_ts,
+        )
+
+    print(f"Posted suggestions to Slack at ts={header_ts}")
 
     # Monitor Creator Map and send urgent alerts (inline)
     alerts = monitor_creator_map()
     for a in alerts:
         slack_post(channel, f"{COACH_TAG} URGENT: {a}")
 
-    # Scan recent messages for :+1: and auto-post to X if not yet processed
+    # Scan recent top-level messages for suggestion headers; then process thread replies
     oldest = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).timestamp()
     messages = slack_history(channel, oldest_ts=oldest, limit=200)
     for m in messages:
-        text = m.get("text", "") or ""
-        if COACH_TAG not in text:
+        parent_text = m.get("text") or ""
+        parent_ts = m.get("ts")
+        if not parent_ts:
             continue
-        ts = m.get("ts")
-        if not ts:
-            continue
-        reactions = {r.get("name"): r.get("count", 0) for r in m.get("reactions", [])}
-        # Skip if already handled
-        if reactions.get(ROBOT_REACTION, 0) > 0:
-            continue
-        # Post if any +1
-        if reactions.get(THUMBS_UP, 0) > 0:
-            # Choose first bullet as the tweet (super simple)
-            lines = []
-            for ln in text.splitlines():
-                stripped = ln.lstrip("- ")
-                stripped = stripped.lstrip("• ")
-                stripped = stripped.lstrip("\t ")
-                if ln.strip().startswith(("-", "•")) and stripped:
-                    lines.append(stripped)
-            tweet = lines[0] if lines else text[:240]
-            try:
-                post_to_x(tweet)
-                slack_add_reaction(channel, ts, ROBOT_REACTION)
-                slack_post(channel, f"{COACH_TAG} Posted to X for ts={ts}")
-                print(f"Posted to X for Slack ts={ts}")
-            except Exception as e:  # keep simple
-                slack_post(channel, f"{COACH_TAG} Error posting to X for ts={ts}: {e}")
-                print(f"Error posting to X: {e}", file=sys.stderr)
+        if COACH_TAG in parent_text and "Suggestions for" in parent_text:
+            replies = slack_thread_replies(channel, parent_ts, limit=100)
+            for r in replies:
+                ts = r.get("ts")
+                if not ts:
+                    continue
+                text = r.get("text") or ""
+                if COACH_TAG not in text or "Tweet" not in text:
+                    continue
+                reactions = {rv.get("name"): rv.get("count", 0) for rv in r.get("reactions", [])}
+                if reactions.get(ROBOT_REACTION, 0) > 0:
+                    continue
+                if reactions.get(THUMBS_UP, 0) > 0:
+                    # Extract content after 'Tweet N:'
+                    after = text.split(":", 1)
+                    tweet = after[1].strip() if len(after) == 2 else text[:240]
+                    try:
+                        post_to_x(tweet)
+                        slack_add_reaction(channel, ts, ROBOT_REACTION)
+                        slack_post(channel, f"{COACH_TAG} Posted to X for ts={ts}")
+                        print(f"Posted to X for Slack ts={ts}")
+                    except Exception as e:
+                        slack_post(channel, f"{COACH_TAG} Error posting to X for ts={ts}: {e}")
+                        print(f"Error posting to X: {e}", file=sys.stderr)
 
 
 def run_afternoon_bip() -> None:
