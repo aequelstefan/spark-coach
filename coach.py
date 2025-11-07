@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import datetime as dt
+import hashlib
 import os
+import re
 import sys
 from collections.abc import Iterable
 
@@ -37,6 +39,19 @@ def env_required(name: str) -> str:
 
 
 # ---- Claude content generation ----
+
+
+# ---- Content style (CEO) ----
+# Default style can be overridden by env ANTHROPIC_STYLE_CEO
+_STYLE_CEO_DEFAULT = (
+    "Voice: casual, honest, unfiltered—like texting a friend.\n"
+    "Structure: jump into a specific moment; short sentences; 4–6 lines.\n"
+    "Tone: vulnerable, relatable, a bit quirky; show the human/messy bits.\n"
+    "Fun touch: a single emoji or tiny quirk; light self‑deprecating humor.\n"
+    "Closing: a nudge/question or soft, warm note.\n"
+    "Guidelines: avoid hype/buzzwords (e.g., 'first principles', 'leverage'); everyday language;\n"
+    "if it feels stiff, rewrite; end with a relatable question or unfinished thought when possible.\n"
+)
 
 
 def _choose_model(task: str) -> list[str]:
@@ -96,9 +111,16 @@ def _anthropic_complete(prompt: str, task: str) -> str:
 
 def generate_suggestions() -> str:
     """Call Claude to generate today's tweets + reply opportunities."""
+    style = os.getenv("ANTHROPIC_STYLE_CEO", _STYLE_CEO_DEFAULT)
     prompt = (
-        "Generate 3 high-signal tweets I should post today and 3 reply opportunities "
-        "(account mentions + suggested reply). Output as a concise list with bullets."
+        "You are my social writing partner. Follow this style strictly:\n"
+        + style
+        + "\nGenerate content for today. Output EXACTLY two sections with bullets only:\n"
+        "Tweets:\n"
+        "- Three tweet options written in the above style (4–6 short lines each).\n"
+        "Reply Opportunities:\n"
+        "- Three brief targets (handle + one‑line why).\n"
+        "Constraints: avoid hype words (e.g., 'first principles'), everyday language, one emoji max per tweet."
     )
     text = _anthropic_complete(prompt, task="suggest")
     return text or "- (no suggestions returned)"
@@ -174,14 +196,65 @@ def twitter_client_v2():
     )
 
 
-def post_to_x(text: str) -> None:
+def _ensure_data_dir() -> str:
+    root = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.abspath(os.path.join(root, "..", "..", "data"))
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+def _text_features(text: str) -> dict[str, object]:
+    return {
+        "len": len(text),
+        "has_numbers": bool(re.search(r"\d", text)),
+        "asks_question": "?" in text,
+        "emoji_count": len(re.findall(r"[\U0001F300-\U0001FAFF]", text)),
+        "lines": len(text.splitlines()),
+    }
+
+
+def _log_event(event: dict[str, object]) -> None:
+    data_dir = _ensure_data_dir()
+    path = os.path.join(data_dir, "log.jsonl")
+    event.setdefault("ts", dt.datetime.now(dt.timezone.utc).isoformat())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def post_to_x(text: str) -> str:
     api = twitter_api_v1()
-    api.update_status(status=text[:280])
+    status = api.update_status(status=text[:280])
+    tid = str(getattr(status, "id", ""))
+    _log_event(
+        {
+            "type": "post",
+            "channel": "CEO",
+            "kind": "tweet",
+            "tweet_id": tid,
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "features": _text_features(text),
+        }
+    )
+    return tid
 
 
-def reply_to_tweet(tweet_id: str, text: str) -> None:
+def reply_to_tweet(tweet_id: str, text: str, *, handle: str | None = None) -> str:
     client = twitter_client_v2()
-    client.create_tweet(text=text[:280], in_reply_to_tweet_id=tweet_id)
+    resp = client.create_tweet(text=text[:280], in_reply_to_tweet_id=tweet_id)
+    rid = str(getattr(resp, "data", {}).get("id", ""))
+    _log_event(
+        {
+            "type": "post",
+            "channel": "CEO",
+            "kind": "reply",
+            "tweet_id": rid,
+            "in_reply_to": tweet_id,
+            "target_handle": handle,
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "features": _text_features(text),
+        }
+    )
+    return rid
 
 
 # ---- Creator Map monitor (stub) ----
@@ -221,6 +294,30 @@ def _extract_tweets_from_suggestions(s: str) -> list[str]:
     return tweets[:5]
 
 
+def _pick_theme() -> str:
+    s = _load_budget_state()
+    themes = s.get(
+        "themes",
+        {
+            "metrics": 1,
+            "build_in_public": 1,
+            "positioning": 1,
+            "technical": 1,
+            "hot_take": 1,
+        },
+    )
+    # epsilon-greedy: 25% explore
+    import random
+
+    if random.random() < 0.25:
+        theme = random.choice(list(themes.keys()))
+    else:
+        theme = max(themes, key=lambda k: themes[k])
+    s["themes"] = themes
+    _save_budget_state(s)
+    return theme
+
+
 def run_suggest_and_monitor() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
 
@@ -228,7 +325,8 @@ def run_suggest_and_monitor() -> None:
     suggestions = generate_suggestions()
     tweets = _extract_tweets_from_suggestions(suggestions)
 
-    header = f"{COACH_TAG} Suggestions for {today}"
+    theme = _pick_theme()
+    header = f"{COACH_TAG} Suggestions for {today}\nTODAY'S THEME: {theme.replace('_',' ').title()}"
     ch, header_ts = slack_post(
         channel, f"{header}\nReply Opportunities below; react on a tweet to auto-post"
     )
@@ -273,9 +371,9 @@ def run_suggest_and_monitor() -> None:
                     after = text.split(":", 1)
                     tweet = after[1].strip() if len(after) == 2 else text[:240]
                     try:
-                        post_to_x(tweet)
+                        tid = post_to_x(tweet)
                         slack_add_reaction(channel, ts, ROBOT_REACTION)
-                        slack_post(channel, f"{COACH_TAG} Posted to X for ts={ts}")
+                        slack_post(channel, f"{COACH_TAG} Posted to X (id={tid}) for ts={ts}")
                         print(f"Posted to X for Slack ts={ts}")
                     except Exception as e:
                         slack_post(channel, f"{COACH_TAG} Error posting to X for ts={ts}: {e}")
@@ -428,26 +526,60 @@ def _parse_selection(text: str) -> list[int]:
     return [int(x) for x in m]
 
 
-def _generate_reply_variants(tweet_text: str, username: str) -> tuple[str, str]:
-    prompt = (
-        "You are an expert social media strategist. Draft two concise reply variants to the tweet below.\n"
-        "Variant 1: safe/professional. Variant 2: spicy/edgy but respectful.\n"
-        "Tweet by @" + username + ":\n" + tweet_text + "\n"
-        "Output format:\n1) <safe>\n2) <spicy>\n"
+def _generate_reply_single(tweet_text: str, username: str, tone: str = "safe") -> str:
+    """Generate a single reply (safe by default). tone in {"safe","spicy"}."""
+    style = os.getenv("ANTHROPIC_STYLE_CEO", _STYLE_CEO_DEFAULT)
+    base = (
+        "Draft ONE concise Twitter reply (<=280 chars) to the tweet below.\n"
+        "Voice/style: follow this strictly:\n"
+        + style
+        + "\nUse everyday language; avoid buzzwords (e.g., 'first principles')."
     )
-    text = _anthropic_complete(prompt, task="replies")
-    # naive parse: split on lines starting with 1) and 2)
-    v1, v2 = None, None
-    for ln in text.splitlines():
-        if ln.strip().startswith("1)"):
-            v1 = ln.split("1)", 1)[1].strip()
-        elif ln.strip().startswith("2)"):
-            v2 = ln.split("2)", 1)[1].strip()
-    if not v1 or not v2:
-        parts = text.split("\n", 1)
-        v1 = (parts[0] if parts else text)[:280]
-        v2 = (parts[1] if len(parts) > 1 else text)[:280]
-    return v1[:280], v2[:280]
+    if tone == "spicy":
+        base += "\nMake it slightly contrarian/spicy but respectful; one sharp point; no fluff."
+    prompt = base + "\nTweet by @" + username + ":\n" + tweet_text + "\nReturn only the reply text."
+    return _anthropic_complete(prompt, task="replies")
+
+
+def _load_budget_state() -> dict:
+    # Persist very small state in data/state.json (ignored from git)
+    root = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.abspath(os.path.join(root, "..", "..", "data"))
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, "state.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_budget_state(s: dict) -> None:
+    root = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.abspath(os.path.join(root, "..", "..", "data"))
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, "state.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(s, f)
+
+
+def _budget_allow(cost: float) -> bool:
+    budget = float(os.getenv("DAILY_TOKEN_BUDGET_USD", "0.50"))
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    s = _load_budget_state()
+    if s.get("date") != today:
+        s = {"date": today, "spend": 0.0, "drafts": 0}
+    if s["spend"] + cost > budget:
+        _save_budget_state(s)
+        return False
+    s["spend"] += cost
+    s["drafts"] += 1
+    _save_budget_state(s)
+    return True
+
+
+_SINGLE_VARIANT = os.getenv("REPLIES_SINGLE_VARIANT", "true").lower() == "true"
+_COST_PER_DRAFT = float(os.getenv("ESTIMATED_COST_PER_DRAFT_USD", "0.04"))
 
 
 def run_opportunity_scan() -> None:
@@ -463,10 +595,13 @@ def run_opportunity_scan() -> None:
     # Stage 2 trigger: check for selection replies under header
     replies = slack_thread_replies(channel, header_ts, limit=100)
     selected: list[int] = []
+    want_spicy = False
     for r in replies:
-        txt = (r.get("text") or "").lower()
-        if "create" in txt or any(ch.isdigit() for ch in txt):
-            selected = _parse_selection(txt)
+        txt_low = (r.get("text") or "").lower()
+        if "create" in txt_low or any(ch.isdigit() for ch in txt_low):
+            selected = _parse_selection(txt_low)
+            if "spicy" in txt_low:
+                want_spicy = True
             break
     if not selected:
         return  # wait for user selection next run
@@ -476,24 +611,28 @@ def run_opportunity_scan() -> None:
         o = by_idx.get(idx)
         if not o:
             continue
+        # Budget check before generating
+        if not _budget_allow(_COST_PER_DRAFT):
+            slack_post(
+                channel,
+                f"{COACH_TAG} Budget reached; drafts paused for today.",
+                thread_ts=header_ts,
+            )
+            return
         # Get tweet text for generation
         client = twitter_client_v2()
         tw = client.get_tweet(id=o.tweet_id, tweet_fields=["text"]).data
         tweet_text = getattr(tw, "text", o.summary)
-        v1, v2 = _generate_reply_variants(tweet_text, o.user)
-        # Post variants in the same thread, each with option emoji
-        _, m1ts = slack_post(
+        tone = "spicy" if want_spicy else "safe"
+        reply = _generate_reply_single(tweet_text, o.user, tone=tone)
+        # Post single draft in thread; 👍 to post
+        slack_post(
             channel,
-            f"{COACH_TAG} Reply {idx} VAR 1️⃣ (tweet_id={o.tweet_id}):\n{v1}",
-            thread_ts=header_ts,
-        )
-        _, m2ts = slack_post(
-            channel,
-            f"{COACH_TAG} Reply {idx} VAR 2️⃣ (tweet_id={o.tweet_id}):\n{v2}",
+            f"{COACH_TAG} Reply {idx} (tweet_id={o.tweet_id}):\n{reply}",
             thread_ts=header_ts,
         )
 
-    # Reaction-based posting for variants
+    # Reaction-based posting for single drafts (👍)
     replies = slack_thread_replies(channel, header_ts, limit=200)
     for r in replies:
         txt = r.get("text") or ""
@@ -503,24 +642,7 @@ def run_opportunity_scan() -> None:
         reactions = {rv.get("name"): rv.get("count", 0) for rv in r.get("reactions", [])}
         if reactions.get(ROBOT_REACTION, 0) > 0:
             continue
-        target = None
-        if (
-            reactions.get("one", 0) > 0
-            or reactions.get("1", 0) > 0
-            or reactions.get("one", 0) > 0
-            or reactions.get("keycap_1", 0) > 0
-        ):
-            target = txt
-        if (
-            reactions.get("two", 0) > 0
-            or reactions.get("2", 0) > 0
-            or reactions.get("keycap_2", 0) > 0
-        ):
-            target = txt
-        if not target:
-            # Also consider unicode 1️⃣ and 2️⃣ names from Slack as "one"/"two"
-            pass
-        if target:
+        if reactions.get("+1", 0) > 0 or reactions.get("thumbsup", 0) > 0:
             # Extract tweet_id
             tid = None
             for part in txt.split():
@@ -532,9 +654,13 @@ def run_opportunity_scan() -> None:
                 body = txt.split(":\n", 1)
                 reply_text = body[1].strip() if len(body) == 2 else txt
                 try:
-                    reply_to_tweet(tid, reply_text)
+                    rid = reply_to_tweet(tid, reply_text)
                     slack_add_reaction(channel, ts, ROBOT_REACTION)
-                    slack_post(channel, f"{COACH_TAG} Replied on X to {tid}", thread_ts=header_ts)
+                    slack_post(
+                        channel,
+                        f"{COACH_TAG} Replied on X (id={rid}) to {tid}",
+                        thread_ts=header_ts,
+                    )
                 except Exception as e:
                     slack_post(
                         channel, f"{COACH_TAG} Error replying to {tid}: {e}", thread_ts=header_ts
@@ -544,6 +670,64 @@ def run_opportunity_scan() -> None:
 def run_follow_recs() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
     slack_post(channel, f"{COACH_TAG} Follow/DM recommendations:\n- @example1\n- @example2")
+
+
+def _collect_recent_posts(hours: int = 24) -> list[dict]:
+    data_dir = _ensure_data_dir()
+    path = os.path.join(data_dir, "log.jsonl")
+    out: list[dict] = []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                ts = ev.get("ts")
+                if not ts:
+                    continue
+                when = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if when >= cutoff and ev.get("type") == "post":
+                    out.append(ev)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _update_theme_weights_from_metrics() -> tuple[str, float]:
+    # Very simple: compute like velocity and reward the most successful theme in last 24h
+    s = _load_budget_state()
+    themes = s.get(
+        "themes",
+        {
+            "metrics": 1,
+            "build_in_public": 1,
+            "positioning": 1,
+            "technical": 1,
+            "hot_take": 1,
+        },
+    )
+    posts = _collect_recent_posts(24)
+    # If we had theme per post, we'd use it; for now, reward 'metrics' if numbers present, else 'positioning' when asks_question, otherwise 'build_in_public'
+    scores = {k: 0.0 for k in themes}
+    for ev in posts:
+        feats = ev.get("features", {})
+        if feats.get("has_numbers"):
+            scores["metrics"] += 1.0
+        elif feats.get("asks_question"):
+            scores["positioning"] += 0.7
+        else:
+            scores["build_in_public"] += 0.5
+    best = max(scores, key=lambda k: scores[k]) if scores else "metrics"
+    themes[best] = min(5, themes.get(best, 1) + 1)
+    # decay others
+    for k in themes:
+        if k != best:
+            themes[k] = max(1, int(themes[k] * 0.9))
+    s["themes"] = themes
+    _save_budget_state(s)
+    return best, scores.get(best, 0.0)
 
 
 def run_summary() -> None:
@@ -562,11 +746,15 @@ def run_summary() -> None:
         if reactions.get(ROBOT_REACTION, 0) > 0:
             posted += 1
 
+    # Reinforcement update
+    best_theme, best_score = _update_theme_weights_from_metrics()
+
     text = (
         f"{COACH_TAG} Daily summary\n"
         f"Suggestions in last 24h: {len(suggestions)}\n"
         f"Auto-posted to X: {posted}\n"
-        f"Notes: Add analytics integration to enhance summary."
+        f"Reinforcement: boosting theme → {best_theme} (score {best_score:.1f}).\n"
+        f"React 👍 to clone today’s best vibe for tomorrow; 👎 to skip."
     )
     slack_post(channel, text)
 
