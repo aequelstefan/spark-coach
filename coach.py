@@ -18,6 +18,9 @@ try:
 except Exception:  # pragma: no cover
     tweepy = None  # type: ignore
 
+import json
+from dataclasses import dataclass
+
 # ---- Config helpers ----
 
 TZ = dt.timezone(dt.timedelta(hours=1))  # CET (simplified; ignores DST)
@@ -142,7 +145,7 @@ def slack_thread_replies(channel: str, thread_ts: str, limit: int = 100) -> list
 # ---- X (Twitter) ----
 
 
-def twitter_api():
+def twitter_api_v1():
     if tweepy is None:
         raise RuntimeError("tweepy package is not installed")
     api_key = env_required("TWITTER_API_KEY")
@@ -153,9 +156,32 @@ def twitter_api():
     return tweepy.API(auth)
 
 
+def twitter_client_v2():
+    if tweepy is None:
+        raise RuntimeError("tweepy package is not installed")
+    bearer = env_required("X_BEARER_TOKEN")
+    api_key = env_required("TWITTER_API_KEY")
+    api_secret = env_required("TWITTER_API_SECRET")
+    access_token = env_required("TWITTER_ACCESS_TOKEN")
+    access_secret = env_required("TWITTER_ACCESS_SECRET")
+    return tweepy.Client(
+        bearer_token=bearer,
+        consumer_key=api_key,
+        consumer_secret=api_secret,
+        access_token=access_token,
+        access_token_secret=access_secret,
+        wait_on_rate_limit=True,
+    )
+
+
 def post_to_x(text: str) -> None:
-    api = twitter_api()
+    api = twitter_api_v1()
     api.update_status(status=text[:280])
+
+
+def reply_to_tweet(tweet_id: str, text: str) -> None:
+    client = twitter_client_v2()
+    client.create_tweet(text=text[:280], in_reply_to_tweet_id=tweet_id)
 
 
 # ---- Creator Map monitor (stub) ----
@@ -277,11 +303,242 @@ def run_reply_engine() -> None:
     slack_post(channel, text)
 
 
+def _load_creators() -> dict[str, list[str]]:
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "creators.json")
+    path = os.path.abspath(path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"tier1": [], "tier2": [], "tier3": []}
+
+
+@dataclass
+class Opportunity:
+    idx: int
+    user: str
+    followers: int
+    tweeted_at: str
+    summary: str
+    why: str
+    metrics: dict
+    score: int
+    tweet_id: str
+
+
+def _score_opportunity(tier: int, metrics: dict, minutes_ago: float) -> int:
+    likes = metrics.get("like_count", 0)
+    rts = metrics.get("retweet_count", 0) + metrics.get("repost_count", 0)
+    replies = metrics.get("reply_count", 0)
+    base = likes * 1 + rts * 2 + replies * 3
+    recency = max(0, 120 - minutes_ago)  # fresh boost
+    tier_boost = 50 if tier == 1 else (20 if tier == 2 else 0)
+    score = int(min(100, (base**0.5) + recency * 0.2 + tier_boost))
+    return score
+
+
+def _fetch_opportunities() -> list[tuple[Opportunity, int]]:
+    creators = _load_creators()
+    users_by_tier: list[tuple[int, list[str]]] = [
+        (1, creators.get("tier1", [])),
+        (2, creators.get("tier2", [])),
+        (3, creators.get("tier3", [])),
+    ]
+    client = twitter_client_v2()
+    # Resolve usernames to IDs
+    usernames = [u for _, lst in users_by_tier for u in lst]
+    if not usernames:
+        return []
+    users = client.get_users(usernames=usernames, user_fields=["public_metrics"]).data or []
+    id_by_username = {u.username.lower(): u.id for u in users}
+    followers_by_username = {
+        u.username.lower(): (u.public_metrics or {}).get("followers_count", 0) for u in users
+    }
+
+    now = dt.datetime.now(dt.timezone.utc)
+    opps: list[tuple[Opportunity, int]] = []
+    for tier, names in users_by_tier:
+        for name in names:
+            uid = id_by_username.get(name.lower())
+            if not uid:
+                continue
+            tweets = (
+                client.get_users_tweets(
+                    id=uid,
+                    max_results=5,
+                    tweet_fields=["created_at", "public_metrics"],
+                    exclude=["retweets", "replies"],
+                ).data
+                or []
+            )
+            for tw in tweets:
+                created_at = tw.created_at if hasattr(tw, "created_at") else None
+                minutes_ago = (now - created_at).total_seconds() / 60 if created_at else 9999
+                metrics = tw.public_metrics or {}
+                score = _score_opportunity(tier, metrics, minutes_ago)
+                why = (
+                    "Tier1 priority"
+                    if tier == 1
+                    else ("High score" if score >= 80 else "Watch list")
+                )
+                summary = (str(getattr(tw, "text", "")).replace("\n", " ")[:140]).strip()
+                opp = Opportunity(
+                    idx=0,
+                    user=name,
+                    followers=followers_by_username.get(name.lower(), 0),
+                    tweeted_at=created_at.isoformat() if created_at else "",
+                    summary=summary,
+                    why=why,
+                    metrics=metrics,
+                    score=score,
+                    tweet_id=str(tw.id),
+                )
+                opps.append((opp, tier))
+    # Select shortlist per rules
+    # Always show all tier1; tier2 if score>80; tier3 if score>90; cap 15
+    shortlist = [o for o, t in opps if t == 1]
+    shortlist += [o for o, t in opps if t == 2 and o.score >= 80]
+    shortlist += [o for o, t in opps if t == 3 and o.score >= 90]
+    shortlist.sort(key=lambda o: o.score, reverse=True)
+    for i, o in enumerate(shortlist[:15], start=1):
+        o.idx = i
+    return [(o, 0) for o in shortlist[:15]]
+
+
+def _post_opportunity_shortlist(channel: str, opps: list[Opportunity]) -> tuple[str, list[str]]:
+    header = f'{COACH_TAG} Opportunities shortlist (reply "create: 1,4,6" to draft)'
+    _, ts = slack_post(channel, header)
+    posted_ts: list[str] = []
+    for o in opps:
+        line = (
+            f"{o.idx}) @{o.user} — {o.summary}\n"
+            f"Why: {o.why} | Score: {o.score} | Metrics: {o.metrics} | Followers: {o.followers}\n"
+            f"tweet_id={o.tweet_id}"
+        )
+        _, child_ts = slack_post(channel, line, thread_ts=ts)
+        posted_ts.append(child_ts)
+    return ts, posted_ts
+
+
+def _parse_selection(text: str) -> list[int]:
+    # e.g., "create: 1,4,6" or "1 4 6"
+    import re
+
+    m = re.findall(r"\d+", text)
+    return [int(x) for x in m]
+
+
+def _generate_reply_variants(tweet_text: str, username: str) -> tuple[str, str]:
+    prompt = (
+        "You are an expert social media strategist. Draft two concise reply variants to the tweet below.\n"
+        "Variant 1: safe/professional. Variant 2: spicy/edgy but respectful.\n"
+        "Tweet by @" + username + ":\n" + tweet_text + "\n"
+        "Output format:\n1) <safe>\n2) <spicy>\n"
+    )
+    text = _anthropic_complete(prompt, task="replies")
+    # naive parse: split on lines starting with 1) and 2)
+    v1, v2 = None, None
+    for ln in text.splitlines():
+        if ln.strip().startswith("1)"):
+            v1 = ln.split("1)", 1)[1].strip()
+        elif ln.strip().startswith("2)"):
+            v2 = ln.split("2)", 1)[1].strip()
+    if not v1 or not v2:
+        parts = text.split("\n", 1)
+        v1 = (parts[0] if parts else text)[:280]
+        v2 = (parts[1] if len(parts) > 1 else text)[:280]
+    return v1[:280], v2[:280]
+
+
 def run_opportunity_scan() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
-    alerts = monitor_creator_map()
-    for a in alerts:
-        slack_post(channel, f"{COACH_TAG} Opportunity: {a}")
+    # Stage 1: fetch and shortlist
+    pairs = _fetch_opportunities()
+    opps = [p[0] for p in pairs]
+    if not opps:
+        slack_post(channel, f"{COACH_TAG} No opportunities found.")
+        return
+    header_ts, _ = _post_opportunity_shortlist(channel, opps)
+
+    # Stage 2 trigger: check for selection replies under header
+    replies = slack_thread_replies(channel, header_ts, limit=100)
+    selected: list[int] = []
+    for r in replies:
+        txt = (r.get("text") or "").lower()
+        if "create" in txt or any(ch.isdigit() for ch in txt):
+            selected = _parse_selection(txt)
+            break
+    if not selected:
+        return  # wait for user selection next run
+
+    by_idx = {o.idx: o for o in opps}
+    for idx in selected:
+        o = by_idx.get(idx)
+        if not o:
+            continue
+        # Get tweet text for generation
+        client = twitter_client_v2()
+        tw = client.get_tweet(id=o.tweet_id, tweet_fields=["text"]).data
+        tweet_text = getattr(tw, "text", o.summary)
+        v1, v2 = _generate_reply_variants(tweet_text, o.user)
+        # Post variants in the same thread, each with option emoji
+        _, m1ts = slack_post(
+            channel,
+            f"{COACH_TAG} Reply {idx} VAR 1️⃣ (tweet_id={o.tweet_id}):\n{v1}",
+            thread_ts=header_ts,
+        )
+        _, m2ts = slack_post(
+            channel,
+            f"{COACH_TAG} Reply {idx} VAR 2️⃣ (tweet_id={o.tweet_id}):\n{v2}",
+            thread_ts=header_ts,
+        )
+
+    # Reaction-based posting for variants
+    replies = slack_thread_replies(channel, header_ts, limit=200)
+    for r in replies:
+        txt = r.get("text") or ""
+        ts = r.get("ts")
+        if not ts or "tweet_id=" not in txt:
+            continue
+        reactions = {rv.get("name"): rv.get("count", 0) for rv in r.get("reactions", [])}
+        if reactions.get(ROBOT_REACTION, 0) > 0:
+            continue
+        target = None
+        if (
+            reactions.get("one", 0) > 0
+            or reactions.get("1", 0) > 0
+            or reactions.get("one", 0) > 0
+            or reactions.get("keycap_1", 0) > 0
+        ):
+            target = txt
+        if (
+            reactions.get("two", 0) > 0
+            or reactions.get("2", 0) > 0
+            or reactions.get("keycap_2", 0) > 0
+        ):
+            target = txt
+        if not target:
+            # Also consider unicode 1️⃣ and 2️⃣ names from Slack as "one"/"two"
+            pass
+        if target:
+            # Extract tweet_id
+            tid = None
+            for part in txt.split():
+                if part.startswith("tweet_id="):
+                    tid = part.split("=", 1)[1]
+                    break
+            if tid:
+                # Extract reply text after colon
+                body = txt.split(":\n", 1)
+                reply_text = body[1].strip() if len(body) == 2 else txt
+                try:
+                    reply_to_tweet(tid, reply_text)
+                    slack_add_reaction(channel, ts, ROBOT_REACTION)
+                    slack_post(channel, f"{COACH_TAG} Replied on X to {tid}", thread_ts=header_ts)
+                except Exception as e:
+                    slack_post(
+                        channel, f"{COACH_TAG} Error replying to {tid}: {e}", thread_ts=header_ts
+                    )
 
 
 def run_follow_recs() -> None:
