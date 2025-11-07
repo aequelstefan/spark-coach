@@ -5,6 +5,11 @@ on:
     # Run every 30 minutes (UTC). Logic in the job selects the specific task for 07:30, 13:00, 17:00 UTC and Sun 19:00 UTC; otherwise runs scan.
     - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      task:
+        description: "Task to run (suggest, afternoon, scan, summary, weekly, replies, recs)"
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -26,6 +31,12 @@ jobs:
       - name: Select task
         id: pick
         run: |
+          # If manual dispatch provides an input, honor it.
+          if [ -n "${{ github.event.inputs.task }}" ]; then
+            echo "task=${{ github.event.inputs.task }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           dow=$(date -u +"%u")   # 1-7 (Mon-Sun)
           hour=$(date -u +"%H")
           min=$(date -u +"%M")
