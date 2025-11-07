@@ -3,7 +3,7 @@ import argparse
 import datetime as dt
 import os
 import sys
-from typing import Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -70,7 +70,7 @@ def slack_client() -> WebClient:
     return WebClient(token=env_required("SLACK_BOT_TOKEN"))
 
 
-def slack_post(channel: str, text: str) -> Tuple[str, str]:
+def slack_post(channel: str, text: str) -> tuple[str, str]:
     """Post a message; returns (channel, ts)."""
     client = slack_client()
     try:
@@ -85,7 +85,7 @@ def slack_add_reaction(channel: str, ts: str, name: str) -> None:
     client.reactions_add(channel=channel, timestamp=ts, name=name)
 
 
-def slack_history(channel: str, oldest_ts: Optional[float] = None, limit: int = 100) -> List[dict]:
+def slack_history(channel: str, oldest_ts: float | None = None, limit: int = 100) -> list[dict]:
     client = slack_client()
     resp = client.conversations_history(channel=channel, limit=limit, oldest=oldest_ts)
     return list(resp.get("messages", []))
@@ -113,7 +113,7 @@ def post_to_x(text: str) -> None:
 # ---- Creator Map monitor (stub) ----
 
 
-def monitor_creator_map() -> List[str]:
+def monitor_creator_map() -> list[str]:
     """Return urgent alerts (strings). Stub for now; integrate data source later."""
     return []
 
@@ -240,7 +240,7 @@ def run_learning_loop() -> None:
     pass
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
+def main(argv: Iterable[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--task",

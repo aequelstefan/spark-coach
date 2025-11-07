@@ -1,12 +1,11 @@
 import os
-from typing import Optional
 
 import httpx
 
 
 async def send_webhook(
-    text: str, webhook_url: Optional[str] = None, **extra_payload: object
-) -> dict:
+    text: str, webhook_url: str | None = None, **extra_payload: object
+) -> dict[str, object]:
     """Send a message to Slack via Incoming Webhook.
 
     Args:
