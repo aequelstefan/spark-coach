@@ -36,26 +36,37 @@ def env_required(name: str) -> str:
 # ---- Claude content generation ----
 
 
-def generate_suggestions() -> str:
-    """Call Claude to generate today's tweets + reply opportunities."""
+def _choose_model(task: str) -> list[str]:
+    # Allow manual override
+    override = os.getenv("ANTHROPIC_MODEL")
+    if override:
+        return [override]
+
+    # Defaults by task: Sonnet 3.5 for core content; Haiku 3.5 for light tasks; fallbacks included
+    if task in {"suggest", "summary", "weekly"}:
+        return [
+            "claude-3-5-sonnet-20241022",  # Sonnet 3.5
+            "claude-3-5-sonnet-latest",
+            "claude-3-opus-latest",  # reasoning backup
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku-20240307",
+        ]
+    # lighter tasks
+    return [
+        "claude-3-5-haiku-20241022",
+        "claude-3-haiku-20240307",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-latest",
+    ]
+
+
+def _anthropic_complete(prompt: str, task: str) -> str:
     api_key = env_required("ANTHROPIC_API_KEY")
     if Anthropic is None:
         raise RuntimeError("anthropic package is not installed")
     client = Anthropic(api_key=api_key)
 
-    prompt = (
-        "Generate 3 high-signal tweets I should post today and 3 reply opportunities "
-        "(account mentions + suggested reply). Output as a concise list with bullets."
-    )
-
-    # Try a few model aliases to be resilient across API updates
-    candidate_models = [
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-sonnet-latest",
-        "claude-3-opus-latest",
-        "claude-3-5-haiku-20241022",
-        "claude-3-haiku-20240307",
-    ]
+    candidate_models = _choose_model(task)
     last_err: Exception | None = None
     msg = None
     for model in candidate_models:
@@ -66,20 +77,27 @@ def generate_suggestions() -> str:
                 messages=[{"role": "user", "content": prompt}],
             )
             break
-        except Exception as e:  # NotFoundError or similar
+        except Exception as e:
             last_err = e
             continue
     if msg is None and last_err is not None:
         raise last_err
 
-    # anthropic python SDK returns content as list of blocks; take plain text
     content_parts: list[str] = []
     for part in msg.content:  # type: ignore[union-attr]
-        # each part may be TextBlock
         text = getattr(part, "text", None) or getattr(part, "content", None)
         if isinstance(text, str):
             content_parts.append(text)
-    text = "\n".join(content_parts).strip()
+    return "\n".join(content_parts).strip()
+
+
+def generate_suggestions() -> str:
+    """Call Claude to generate today's tweets + reply opportunities."""
+    prompt = (
+        "Generate 3 high-signal tweets I should post today and 3 reply opportunities "
+        "(account mentions + suggested reply). Output as a concise list with bullets."
+    )
+    text = _anthropic_complete(prompt, task="suggest")
     return text or "- (no suggestions returned)"
 
 
