@@ -23,8 +23,12 @@ Commands
   - Format code: black .
 - Typecheck
   - mypy src
+- Environment
+  - Required for Slack webhooks: export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+- Manual Slack test
+  - curl -X POST http://127.0.0.1:8000/v1/slack/notify -H 'Content-Type: application/json' -d '{"text":"Hello from spark-coach"}'
 
-Shortcuts (Makefile)
+Architecture (high-level)
 - make venv && make deps
 - make run
 - make test
