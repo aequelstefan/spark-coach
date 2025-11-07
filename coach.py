@@ -44,13 +44,13 @@ def env_required(name: str) -> str:
 # ---- Content style (CEO) ----
 # Default style can be overridden by env ANTHROPIC_STYLE_CEO
 _STYLE_CEO_DEFAULT = (
-    "Voice: casual, honest, unfiltered—like texting a friend.\n"
-    "Structure: jump into a specific moment; short sentences; 4–6 lines.\n"
-    "Tone: vulnerable, relatable, a bit quirky; show the human/messy bits.\n"
-    "Fun touch: a single emoji or tiny quirk; light self‑deprecating humor.\n"
-    "Closing: a nudge/question or soft, warm note.\n"
-    "Guidelines: avoid hype/buzzwords (e.g., 'first principles', 'leverage'); everyday language;\n"
-    "if it feels stiff, rewrite; end with a relatable question or unfinished thought when possible.\n"
+    "Voice: conversational and human, but professional (no slang).\n"
+    "Structure: jump into a concrete moment; short sentences; 4–6 lines.\n"
+    "Tone: honest, warm, a touch vulnerable; show real trade‑offs.\n"
+    "Fun touch: at most one subtle emoji; no hype.\n"
+    "Closing: a light nudge or question to invite replies.\n"
+    "Guidelines: avoid buzzwords (e.g., 'first principles', 'leverage'); everyday language;\n"
+    "rewrite anything that feels stiff; finish with a relatable question or unfinished thought when it helps.\n"
 )
 
 
@@ -628,16 +628,90 @@ def run_opportunity_scan() -> None:
         # Post single draft in thread; 👍 to post
         slack_post(
             channel,
-            f"{COACH_TAG} Reply {idx} (tweet_id={o.tweet_id}):\n{reply}",
+            f"{COACH_TAG} Reply {idx} (tweet_id={o.tweet_id}):\n{reply}\n\nActions: 👍 to post · or reply in thread: 'post {idx}' or 'edit {idx}: <text>'",
             thread_ts=header_ts,
         )
 
-    # Reaction-based posting for single drafts (👍)
+    # Reaction-based posting for single drafts (👍) and typed commands (post/edit)
     replies = slack_thread_replies(channel, header_ts, limit=200)
+    # Index latest draft by idx
+    latest_by_idx: dict[int, tuple[str, str]] = {}
+    for msg in replies:
+        mtxt = msg.get("text") or ""
+        if COACH_TAG in mtxt and "Reply" in mtxt and "tweet_id=" in mtxt:
+            # Parse idx and tweet_id
+            try:
+                # e.g., "[coach] Reply 3 (tweet_id=123):\n..."
+                idx_part = mtxt.split("Reply", 1)[1].strip()
+                idx_num = int(idx_part.split(" ", 1)[0])
+            except Exception:
+                continue
+            tid = None
+            for part in mtxt.split():
+                if part.startswith("tweet_id="):
+                    tid = part.split("=", 1)[1].rstrip("):")
+                    break
+            body = mtxt.split(":\n", 1)
+            reply_text = body[1].strip() if len(body) == 2 else ""
+            if tid and reply_text:
+                latest_by_idx[idx_num] = (tid, reply_text)
+
     for r in replies:
-        txt = r.get("text") or ""
+        txt = (r.get("text") or "").strip()
         ts = r.get("ts")
-        if not ts or "tweet_id=" not in txt:
+        if not ts:
+            continue
+        # Handle typed commands first
+        if txt.lower().startswith("post "):
+            try:
+                idx = int(txt.split()[1])
+            except Exception:
+                idx = -1
+            if idx in latest_by_idx:
+                tid, reply_text = latest_by_idx[idx]
+                try:
+                    rid = reply_to_tweet(tid, reply_text)
+                    slack_add_reaction(channel, ts, ROBOT_REACTION)
+                    slack_post(
+                        channel,
+                        f"{COACH_TAG} Replied on X (id={rid}) to {tid}",
+                        thread_ts=header_ts,
+                    )
+                except Exception as e:
+                    slack_post(
+                        channel, f"{COACH_TAG} Error replying to {tid}: {e}", thread_ts=header_ts
+                    )
+            continue
+        if txt.lower().startswith("edit "):
+            # format: edit 3: new text
+            parts = txt.split(None, 2)
+            if len(parts) >= 2:
+                try:
+                    idx = int(parts[1].rstrip(":"))
+                except Exception:
+                    idx = -1
+                new_text = ""
+                if len(parts) == 3:
+                    new_text = parts[2].lstrip(": ")
+                if idx in latest_by_idx and new_text:
+                    tid, _old = latest_by_idx[idx]
+                    try:
+                        rid = reply_to_tweet(tid, new_text)
+                        slack_add_reaction(channel, ts, ROBOT_REACTION)
+                        slack_post(
+                            channel,
+                            f"{COACH_TAG} Replied on X (id={rid}) to {tid}",
+                            thread_ts=header_ts,
+                        )
+                    except Exception as e:
+                        slack_post(
+                            channel,
+                            f"{COACH_TAG} Error replying to {tid}: {e}",
+                            thread_ts=header_ts,
+                        )
+            continue
+        # Then handle 👍 on a draft message itself
+        if "tweet_id=" not in txt:
             continue
         reactions = {rv.get("name"): rv.get("count", 0) for rv in r.get("reactions", [])}
         if reactions.get(ROBOT_REACTION, 0) > 0:
