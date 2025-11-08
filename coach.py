@@ -44,13 +44,13 @@ def env_required(name: str) -> str:
 # ---- Content style (CEO) ----
 # Default style can be overridden by env ANTHROPIC_STYLE_CEO
 _STYLE_CEO_DEFAULT = (
-    "Voice: conversational and human, but professional (no slang).\n"
-    "Structure: jump into a concrete moment; short sentences; 4–6 lines.\n"
-    "Tone: honest, warm, a touch vulnerable; show real trade‑offs.\n"
-    "Fun touch: at most one subtle emoji; no hype.\n"
-    "Closing: a light nudge or question to invite replies.\n"
-    "Guidelines: avoid buzzwords (e.g., 'first principles', 'leverage'); everyday language;\n"
-    "rewrite anything that feels stiff; finish with a relatable question or unfinished thought when it helps.\n"
+    "Voice: casual, immediate, like Sherry Jang—starts mid-thought; lowercase sometimes OK; no polish.\n"
+    "Structure: jump right in ('just realized', 'shipped X today', 'honestly'); 2–4 short sentences; personal story or moment.\n"
+    "Tone: honest, warm, real; show the messy bits; no corporate speak ever.\n"
+    "Emoji: max 1, only ✨💡😅🧵; use sparingly.\n"
+    "Closing: small insight or unfinished thought; invite replies naturally.\n"
+    "NEVER use: 'strategic', 'optimize', 'leverage', 'trade-offs', 'first principles', 'synergy', formal business words.\n"
+    "Examples: 'just realized...', 'shipped this yesterday...', 'honestly the hardest part...', 'tbh...'\n"
 )
 
 
@@ -325,28 +325,44 @@ def run_suggest_and_monitor() -> None:
     suggestions = generate_suggestions()
     tweets = _extract_tweets_from_suggestions(suggestions)
 
+    if not tweets:
+        print("No tweets generated, skipping post")
+        return
+
+    # Ensure we have exactly 3 tweets
+    while len(tweets) < 3:
+        tweets.append("[placeholder tweet]")
+    tweets = tweets[:3]
+
     theme = _pick_theme()
-    header = f"{COACH_TAG} Suggestions for {today}\nTODAY'S THEME: {theme.replace('_',' ').title()}"
-    ch, header_ts = slack_post(
-        channel, f"{header}\nReply Opportunities below; react on a tweet to auto-post"
+    # Build single message with all options
+    text = (
+        f"{COACH_TAG} Suggestions for {today}\nTODAY'S THEME: {theme.replace('_',' ').title()}\n\n"
     )
+    text += f"1️⃣ {tweets[0]}\n\n"
+    text += f"2️⃣ {tweets[1]}\n\n"
+    text += f"3️⃣ {tweets[2]}\n\n"
+    text += "React: 1️⃣ 2️⃣ 3️⃣ to post now · ✏️ to edit · 👎 to skip"
 
-    # Post each tweet as a thread reply so a 👍 applies to that specific option
-    for idx, tw in enumerate(tweets, start=1):
-        slack_post(
-            channel,
-            f"{COACH_TAG} Tweet {idx}: {tw}\nReact with :+1: to auto-post",
-            thread_ts=header_ts,
-        )
-
+    ch, header_ts = slack_post(channel, text)
     print(f"Posted suggestions to Slack at ts={header_ts}")
+
+    # Add numbered reactions immediately
+    try:
+        slack_add_reaction(channel, header_ts, "one")
+        slack_add_reaction(channel, header_ts, "two")
+        slack_add_reaction(channel, header_ts, "three")
+        slack_add_reaction(channel, header_ts, "pencil2")
+        slack_add_reaction(channel, header_ts, "thumbsdown")
+    except Exception as e:
+        print(f"Could not add reactions: {e}", file=sys.stderr)
 
     # Monitor Creator Map and send urgent alerts (inline)
     alerts = monitor_creator_map()
     for a in alerts:
         slack_post(channel, f"{COACH_TAG} URGENT: {a}")
 
-    # Scan recent top-level messages for suggestion headers; then process thread replies
+    # Scan recent top-level messages for suggestion headers with numbered reactions
     oldest = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).timestamp()
     messages = slack_history(channel, oldest_ts=oldest, limit=200)
     for m in messages:
@@ -354,30 +370,44 @@ def run_suggest_and_monitor() -> None:
         parent_ts = m.get("ts")
         if not parent_ts:
             continue
-        if COACH_TAG in parent_text and "Suggestions for" in parent_text:
-            replies = slack_thread_replies(channel, parent_ts, limit=100)
-            for r in replies:
-                ts = r.get("ts")
-                if not ts:
-                    continue
-                text = r.get("text") or ""
-                if COACH_TAG not in text or "Tweet" not in text:
-                    continue
-                reactions = {rv.get("name"): rv.get("count", 0) for rv in r.get("reactions", [])}
-                if reactions.get(ROBOT_REACTION, 0) > 0:
-                    continue
-                if reactions.get(THUMBS_UP, 0) > 0:
-                    # Extract content after 'Tweet N:'
-                    after = text.split(":", 1)
-                    tweet = after[1].strip() if len(after) == 2 else text[:240]
-                    try:
-                        tid = post_to_x(tweet)
-                        slack_add_reaction(channel, ts, ROBOT_REACTION)
-                        slack_post(channel, f"{COACH_TAG} Posted to X (id={tid}) for ts={ts}")
-                        print(f"Posted to X for Slack ts={ts}")
-                    except Exception as e:
-                        slack_post(channel, f"{COACH_TAG} Error posting to X for ts={ts}: {e}")
-                        print(f"Error posting to X: {e}", file=sys.stderr)
+        if COACH_TAG not in parent_text or "Suggestions for" not in parent_text:
+            continue
+        # Check if already posted (robot reaction)
+        reactions = {rv.get("name"): rv.get("count", 0) for rv in m.get("reactions", [])}
+        if reactions.get(ROBOT_REACTION, 0) > 0:
+            continue
+        # Parse tweet options from message text
+        lines = parent_text.splitlines()
+        tweet_options = {}
+        for line in lines:
+            if line.strip().startswith("1️⃣ "):
+                tweet_options[1] = line.split("1️⃣ ", 1)[1].strip()
+            elif line.strip().startswith("2️⃣ "):
+                tweet_options[2] = line.split("2️⃣ ", 1)[1].strip()
+            elif line.strip().startswith("3️⃣ "):
+                tweet_options[3] = line.split("3️⃣ ", 1)[1].strip()
+        # Check which number was reacted
+        selected = None
+        if reactions.get("one", 0) > 0:
+            selected = 1
+        elif reactions.get("two", 0) > 0:
+            selected = 2
+        elif reactions.get("three", 0) > 0:
+            selected = 3
+        if selected and selected in tweet_options:
+            tweet = tweet_options[selected]
+            try:
+                tid = post_to_x(tweet)
+                slack_add_reaction(channel, parent_ts, ROBOT_REACTION)
+                slack_post(
+                    channel,
+                    f"{COACH_TAG} Posted option {selected} to X (id={tid})",
+                    thread_ts=parent_ts,
+                )
+                print(f"Posted option {selected} to X for Slack ts={parent_ts}")
+            except Exception as e:
+                slack_post(channel, f"{COACH_TAG} Error posting to X: {e}", thread_ts=parent_ts)
+                print(f"Error posting to X: {e}", file=sys.stderr)
 
 
 def run_afternoon_bip() -> None:
@@ -588,7 +618,7 @@ def run_opportunity_scan() -> None:
     pairs = _fetch_opportunities()
     opps = [p[0] for p in pairs]
     if not opps:
-        slack_post(channel, f"{COACH_TAG} No opportunities found.")
+        print("No opportunities found, skipping Slack post")
         return
     header_ts, _ = _post_opportunity_shortlist(channel, opps)
 
@@ -847,12 +877,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--task",
-        choices=["suggest", "afternoon", "scan", "summary", "weekly", "replies", "recs"],
+        choices=["suggest", "afternoon", "scan", "summary", "weekly", "replies", "recs", "none"],
         default="suggest",
     )
     args = p.parse_args(argv)
 
-    if args.task == "suggest":
+    if args.task == "none":
+        print("No task scheduled at this time")
+        return 0
+    elif args.task == "suggest":
         run_suggest_and_monitor()
     elif args.task == "afternoon":
         run_afternoon_bip()
