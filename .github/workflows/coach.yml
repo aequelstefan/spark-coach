@@ -40,20 +40,16 @@ jobs:
           dow=$(date -u +"%u")   # 1-7 (Mon-Sun)
           hour=$(date -u +"%H")
           min=$(date -u +"%M")
-          task=""
+          task="metrics"  # Default: background metrics fetch every 30min
           if [ "$hour" = "07" ] && [ "$min" = "30" ]; then task="suggest"; fi
           if [ "$hour" = "13" ] && [ "$min" = "00" ]; then task="afternoon"; fi
-          if [ "$hour" = "17" ] && [ "$min" = "00" ]; then task="summary"; fi
+          if [ "$hour" = "18" ] && [ "$min" = "00" ]; then task="summary"; fi
           if [ "$dow" = "7" ] && [ "$hour" = "19" ] && [ "$min" = "00" ]; then task="weekly"; fi
-          # Scan only at 09:15, 12:00, 15:30 UTC
+          # Scan only at 09:00, 12:00, 15:30 UTC
           if [ "$hour" = "09" ] && [ "$min" = "00" ]; then task="scan"; fi
           if [ "$hour" = "12" ] && [ "$min" = "00" ]; then task="scan"; fi
           if [ "$hour" = "15" ] && [ "$min" = "30" ]; then task="scan"; fi
-          if [ -z "$task" ]; then
-            echo "task=none" >> $GITHUB_OUTPUT
-          else
-            echo "task=$task" >> $GITHUB_OUTPUT
-          fi
+          echo "task=$task" >> $GITHUB_OUTPUT
 
       - name: Run coach
         env:

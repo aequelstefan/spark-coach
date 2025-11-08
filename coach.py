@@ -221,6 +221,67 @@ def _log_event(event: dict[str, object]) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def _fetch_tweet_metrics(tweet_id: str) -> dict:
+    """Fetch current metrics for a tweet (free X API call)."""
+    try:
+        client = twitter_client_v2()
+        tw = client.get_tweet(id=tweet_id, tweet_fields=["public_metrics"]).data
+        if not tw:
+            return {}
+        return tw.public_metrics or {}
+    except Exception as e:
+        print(f"Error fetching metrics for tweet {tweet_id}: {e}", file=sys.stderr)
+        return {}
+
+
+def _store_metrics_snapshot(tweet_id: str, metrics: dict, age_label: str) -> None:
+    """Store metrics snapshot in data/metrics.jsonl."""
+    data_dir = _ensure_data_dir()
+    path = os.path.join(data_dir, "metrics.jsonl")
+    snapshot = {
+        "tweet_id": tweet_id,
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "age_label": age_label,
+        "metrics": metrics,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+
+
+def _background_metrics_fetch() -> None:
+    """Background job: fetch metrics for recent posts at 30min, 2h, 6h, 24h intervals."""
+    data_dir = _ensure_data_dir()
+    log_path = os.path.join(data_dir, "log.jsonl")
+    now = dt.datetime.now(dt.timezone.utc)
+
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("type") != "post" or not ev.get("tweet_id"):
+                    continue
+                tweet_id = ev["tweet_id"]
+                ts = ev.get("ts")
+                if not ts:
+                    continue
+                posted_at = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                age_minutes = (now - posted_at).total_seconds() / 60
+
+                # Fetch at 30min, 2h, 6h, 24h
+                intervals = [(30, "30m"), (120, "2h"), (360, "6h"), (1440, "24h")]
+                for target_mins, label in intervals:
+                    # Fetch if within 5min window of target
+                    if abs(age_minutes - target_mins) < 5:
+                        metrics = _fetch_tweet_metrics(tweet_id)
+                        if metrics:
+                            _store_metrics_snapshot(tweet_id, metrics, label)
+    except FileNotFoundError:
+        pass
+
+
 def post_to_x(text: str) -> str:
     api = twitter_api_v1()
     status = api.update_status(status=text[:280])
@@ -260,9 +321,60 @@ def reply_to_tweet(tweet_id: str, text: str, *, handle: str | None = None) -> st
 # ---- Creator Map monitor (stub) ----
 
 
+def _detect_urgent_opportunities() -> list[str]:
+    """Detect urgent opportunities: AMA/Q&A posts <15min old with >20 replies."""
+    creators = _load_creators()
+    tier1 = creators.get("tier1", [])
+    if not tier1:
+        return []
+    client = twitter_client_v2()
+    users = client.get_users(usernames=tier1, user_fields=["public_metrics"]).data or []
+    id_by_username = {u.username.lower(): u.id for u in users}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    alerts: list[str] = []
+
+    for name in tier1:
+        uid = id_by_username.get(name.lower())
+        if not uid:
+            continue
+        tweets = (
+            client.get_users_tweets(
+                id=uid,
+                max_results=5,
+                tweet_fields=["created_at", "public_metrics"],
+                exclude=["retweets", "replies"],
+            ).data
+            or []
+        )
+        for tw in tweets:
+            text = str(getattr(tw, "text", "")).lower()
+            created_at = tw.created_at if hasattr(tw, "created_at") else None
+            if not created_at:
+                continue
+            minutes_ago = (now - created_at).total_seconds() / 60
+            if minutes_ago > 15:
+                continue
+            metrics = tw.public_metrics or {}
+            replies = metrics.get("reply_count", 0)
+            if replies < 20:
+                continue
+            # Check for AMA/Q&A patterns
+            if any(kw in text for kw in ["ama", "ask me", "q&a", "questions", "answer anything"]):
+                summary = str(getattr(tw, "text", ""))[:100].replace("\n", " ")
+                alerts.append(
+                    f"@{name} — {summary} | {int(minutes_ago)}m ago | {replies} replies | tweet_id={tw.id}"
+                )
+    return alerts
+
+
 def monitor_creator_map() -> list[str]:
-    """Return urgent alerts (strings). Stub for now; integrate data source later."""
-    return []
+    """Return urgent alerts (strings). Uses _detect_urgent_opportunities()."""
+    try:
+        return _detect_urgent_opportunities()
+    except Exception as e:
+        print(f"Error detecting urgent opportunities: {e}", file=sys.stderr)
+        return []
 
 
 # ---- Main flows ----
@@ -834,38 +946,145 @@ def _update_theme_weights_from_metrics() -> tuple[str, float]:
     return best, scores.get(best, 0.0)
 
 
-def run_summary() -> None:
-    channel = env_required("SLACK_CHANNEL_ID")
-    oldest = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).timestamp()
-    messages = slack_history(channel, oldest_ts=oldest, limit=200)
+def _get_recent_metrics() -> list[dict]:
+    """Load recent metrics snapshots from data/metrics.jsonl."""
+    data_dir = _ensure_data_dir()
+    path = os.path.join(data_dir, "metrics.jsonl")
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
+    snapshots: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    snap = json.loads(line)
+                except Exception:
+                    continue
+                ts = snap.get("ts")
+                if not ts:
+                    continue
+                when = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if when >= cutoff:
+                    snapshots.append(snap)
+    except FileNotFoundError:
+        pass
+    return snapshots
 
-    suggestions = [
-        m
-        for m in messages
-        if COACH_TAG in (m.get("text") or "") and "Suggestions" in (m.get("text") or "")
-    ]
-    posted = 0
-    for m in messages:
-        reactions = {r.get("name"): r.get("count", 0) for r in m.get("reactions", [])}
-        if reactions.get(ROBOT_REACTION, 0) > 0:
-            posted += 1
+
+def run_summary() -> None:
+    """Daily analytics report: raw metrics, theme reinforcement, separate thread."""
+    channel = env_required("SLACK_CHANNEL_ID")
+
+    # Count posts from last 24h
+    posts = _collect_recent_posts(24)
+    tweets = [p for p in posts if p.get("kind") == "tweet"]
+    replies = [p for p in posts if p.get("kind") == "reply"]
+
+    # Fetch latest metrics for today's tweets
+    tweet_ids = [p["tweet_id"] for p in tweets]
+    metrics_summary: list[str] = []
+    for tid in tweet_ids:
+        metrics = _fetch_tweet_metrics(tid)
+        if metrics:
+            likes = metrics.get("like_count", 0)
+            rts = metrics.get("retweet_count", 0)
+            replies_count = metrics.get("reply_count", 0)
+            impressions = metrics.get("impression_count", "N/A")
+            metrics_summary.append(
+                f"Tweet {tid}: {likes} likes, {rts} RTs, {replies_count} replies, {impressions} impressions"
+            )
 
     # Reinforcement update
     best_theme, best_score = _update_theme_weights_from_metrics()
 
+    # Build report
     text = (
-        f"{COACH_TAG} Daily summary\n"
-        f"Suggestions in last 24h: {len(suggestions)}\n"
-        f"Auto-posted to X: {posted}\n"
-        f"Reinforcement: boosting theme → {best_theme} (score {best_score:.1f}).\n"
-        f"React 👍 to clone today’s best vibe for tomorrow; 👎 to skip."
+        f"{COACH_TAG} Daily Analytics ({dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d')})\n\n"
     )
+    text += "**Posts Today:**\n"
+    text += f"- Tweets: {len(tweets)}\n"
+    text += f"- Replies: {len(replies)}\n\n"
+    text += "**Metrics (latest):**\n"
+    if metrics_summary:
+        text += "\n".join(f"- {m}" for m in metrics_summary) + "\n\n"
+    else:
+        text += "- No metrics available yet\n\n"
+    text += "**Reinforcement:**\n"
+    text += f"- Best theme: {best_theme} (score {best_score:.1f})\n"
+    text += "- Boosted weight for tomorrow's content\n\n"
+    text += "_Automated daily report. No token cost for metrics._"
+
+    # Post in separate thread
     slack_post(channel, text)
 
 
 def run_weekly_brief() -> None:
+    """Weekly strategy brief: aggregate stats, top performers, theme trends."""
     channel = env_required("SLACK_CHANNEL_ID")
-    slack_post(channel, f"{COACH_TAG} Weekly strategy brief (stub)\n- Wins\n- Misses\n- Plan")
+
+    # Collect last 7 days
+    posts = _collect_recent_posts(168)  # 7 days
+    tweets = [p for p in posts if p.get("kind") == "tweet"]
+    replies = [p for p in posts if p.get("kind") == "reply"]
+
+    # Aggregate metrics from snapshots
+    snapshots = _get_recent_metrics()
+    metrics_by_tweet: dict[str, dict] = {}
+    for snap in snapshots:
+        tid = snap.get("tweet_id")
+        if not tid or snap.get("age_label") != "24h":
+            continue
+        metrics_by_tweet[tid] = snap.get("metrics", {})
+
+    # Find top performer
+    top_tweet = ""
+    top_score = 0
+    for tid, metrics in metrics_by_tweet.items():
+        likes = metrics.get("like_count", 0)
+        rts = metrics.get("retweet_count", 0)
+        score = likes + rts * 2
+        if score > top_score:
+            top_score = score
+            top_tweet = tid
+
+    # Theme distribution
+    s = _load_budget_state()
+    themes = s.get("themes", {})
+    sorted_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)
+
+    # Build report
+    text = f"{COACH_TAG} Weekly Brief ({dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d')})\n\n"
+    text += "**Activity:**\n"
+    text += f"- Tweets: {len(tweets)}\n"
+    text += f"- Replies: {len(replies)}\n\n"
+    text += "**Top Performer:**\n"
+    if top_tweet:
+        text += f"- Tweet {top_tweet} ({top_score} engagement)\n\n"
+    else:
+        text += "- No data yet\n\n"
+    text += "**Theme Weights (current):**\n"
+    for theme, weight in sorted_themes:
+        text += f"- {theme.replace('_', ' ').title()}: {weight}\n"
+    text += "\n_Weekly automated report. No LLM tokens used._"
+
+    slack_post(channel, text)
+
+
+def run_ad_hoc_stats(query: str = "") -> None:
+    """Ad-hoc stats command: show simple aggregated metrics (no LLM, just scrape)."""
+    channel = env_required("SLACK_CHANNEL_ID")
+    posts = _collect_recent_posts(168)  # last 7 days
+    tweets = [p for p in posts if p.get("kind") == "tweet"]
+    replies = [p for p in posts if p.get("kind") == "reply"]
+
+    text = f"{COACH_TAG} Ad-hoc Stats\n"
+    text += f"Last 7 days: {len(tweets)} tweets, {len(replies)} replies\n"
+    text += f"Features: {sum(1 for p in tweets if p.get('features', {}).get('has_numbers'))} with numbers, "
+    text += (
+        f"{sum(1 for p in tweets if p.get('features', {}).get('asks_question'))} with questions\n"
+    )
+    text += "_No LLM cost._"
+
+    slack_post(channel, text)
 
 
 def run_learning_loop() -> None:
@@ -873,11 +1092,28 @@ def run_learning_loop() -> None:
     pass
 
 
+def run_background_metrics() -> None:
+    """Run background metrics fetch (called every 30min by GitHub Actions)."""
+    _background_metrics_fetch()
+    print("Background metrics fetch complete")
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--task",
-        choices=["suggest", "afternoon", "scan", "summary", "weekly", "replies", "recs", "none"],
+        choices=[
+            "suggest",
+            "afternoon",
+            "scan",
+            "summary",
+            "weekly",
+            "replies",
+            "recs",
+            "stats",
+            "metrics",
+            "none",
+        ],
         default="suggest",
     )
     args = p.parse_args(argv)
@@ -899,6 +1135,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         run_reply_engine()
     elif args.task == "recs":
         run_follow_recs()
+    elif args.task == "stats":
+        run_ad_hoc_stats()
+    elif args.task == "metrics":
+        run_background_metrics()
     run_learning_loop()
     return 0
 
