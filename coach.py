@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable
+from typing import Optional
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -85,7 +86,7 @@ def _anthropic_complete(prompt: str, task: str) -> str:
     client = Anthropic(api_key=api_key)
 
     candidate_models = _choose_model(task)
-    last_err: Exception | None = None
+    last_err: Optional[Exception] = None
     msg = None
     for model in candidate_models:
         try:
@@ -133,7 +134,7 @@ def slack_client() -> WebClient:
     return WebClient(token=env_required("SLACK_BOT_TOKEN"))
 
 
-def slack_post(channel: str, text: str, *, thread_ts: str | None = None) -> tuple[str, str]:
+def slack_post(channel: str, text: str, *, thread_ts: Optional[str] = None) -> tuple[str, str]:
     """Post a message; returns (channel, ts)."""
     client = slack_client()
     try:
@@ -148,7 +149,7 @@ def slack_add_reaction(channel: str, ts: str, name: str) -> None:
     client.reactions_add(channel=channel, timestamp=ts, name=name)
 
 
-def slack_history(channel: str, oldest_ts: float | None = None, limit: int = 100) -> list[dict]:
+def slack_history(channel: str, oldest_ts: Optional[float] = None, limit: int = 100) -> list[dict]:
     client = slack_client()
     resp = client.conversations_history(channel=channel, limit=limit, oldest=oldest_ts)
     return list(resp.get("messages", []))
@@ -299,7 +300,7 @@ def post_to_x(text: str) -> str:
     return tid
 
 
-def reply_to_tweet(tweet_id: str, text: str, *, handle: str | None = None) -> str:
+def reply_to_tweet(tweet_id: str, text: str, *, handle: Optional[str] = None) -> str:
     client = twitter_client_v2()
     resp = client.create_tweet(text=text[:280], in_reply_to_tweet_id=tweet_id)
     rid = str(getattr(resp, "data", {}).get("id", ""))
@@ -1098,7 +1099,7 @@ def run_background_metrics() -> None:
     print("Background metrics fetch complete")
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Optional[Iterable[str]] = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--task",
