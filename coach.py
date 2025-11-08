@@ -5,8 +5,8 @@ import hashlib
 import os
 import re
 import sys
+import time
 from collections.abc import Iterable
-from typing import Optional
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -86,7 +86,7 @@ def _anthropic_complete(prompt: str, task: str) -> str:
     client = Anthropic(api_key=api_key)
 
     candidate_models = _choose_model(task)
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     msg = None
     for model in candidate_models:
         try:
@@ -113,12 +113,23 @@ def _anthropic_complete(prompt: str, task: str) -> str:
 def generate_suggestions() -> str:
     """Call Claude to generate today's tweets + reply opportunities."""
     style = os.getenv("ANTHROPIC_STYLE_CEO", _STYLE_CEO_DEFAULT)
+    topics = os.getenv(
+        "CONTENT_TOPICS",
+        (
+            "Company: Spark Coach — AI coach for social media. Focus only on: "
+            "building-in-public updates, cost optimization wins, automation workflows, "
+            "analytics + learning loop improvements, opportunity radar/replies strategy, CEO micro-moments."
+        ),
+    )
     prompt = (
         "You are my social writing partner. Follow this style strictly:\n"
         + style
+        + "\nContext and constraints:\n"
+        + topics
+        + "\nDo NOT write generic motivation or advice. Make it specific to what we shipped this week.\n"
         + "\nGenerate content for today. Output EXACTLY two sections with bullets only:\n"
         "Tweets:\n"
-        "- Three tweet options written in the above style (4–6 short lines each).\n"
+        "- Three tweet options written in the above style (2–4 short lines each).\n"
         "Reply Opportunities:\n"
         "- Three brief targets (handle + one‑line why).\n"
         "Constraints: avoid hype words (e.g., 'first principles'), everyday language, one emoji max per tweet."
@@ -134,7 +145,7 @@ def slack_client() -> WebClient:
     return WebClient(token=env_required("SLACK_BOT_TOKEN"))
 
 
-def slack_post(channel: str, text: str, *, thread_ts: Optional[str] = None) -> tuple[str, str]:
+def slack_post(channel: str, text: str, *, thread_ts: str | None = None) -> tuple[str, str]:
     """Post a message; returns (channel, ts)."""
     client = slack_client()
     try:
@@ -149,7 +160,7 @@ def slack_add_reaction(channel: str, ts: str, name: str) -> None:
     client.reactions_add(channel=channel, timestamp=ts, name=name)
 
 
-def slack_history(channel: str, oldest_ts: Optional[float] = None, limit: int = 100) -> list[dict]:
+def slack_history(channel: str, oldest_ts: float | None = None, limit: int = 100) -> list[dict]:
     client = slack_client()
     resp = client.conversations_history(channel=channel, limit=limit, oldest=oldest_ts)
     return list(resp.get("messages", []))
@@ -163,6 +174,14 @@ def slack_thread_replies(channel: str, thread_ts: str, limit: int = 100) -> list
     if msgs and msgs[0].get("ts") == thread_ts:
         return msgs[1:]
     return msgs
+
+
+def slack_get_message(channel: str, ts: str) -> dict | None:
+    """Fetch a single message (parent) including reactions."""
+    client = slack_client()
+    resp = client.conversations_replies(channel=channel, ts=ts, limit=1)
+    msgs = list(resp.get("messages", []))
+    return msgs[0] if msgs else None
 
 
 # ---- X (Twitter) ----
@@ -300,7 +319,7 @@ def post_to_x(text: str) -> str:
     return tid
 
 
-def reply_to_tweet(tweet_id: str, text: str, *, handle: Optional[str] = None) -> str:
+def reply_to_tweet(tweet_id: str, text: str, *, handle: str | None = None) -> str:
     client = twitter_client_v2()
     resp = client.create_tweet(text=text[:280], in_reply_to_tweet_id=tweet_id)
     rid = str(getattr(resp, "data", {}).get("id", ""))
@@ -469,6 +488,51 @@ def run_suggest_and_monitor() -> None:
         slack_add_reaction(channel, header_ts, "thumbsdown")
     except Exception as e:
         print(f"Could not add reactions: {e}", file=sys.stderr)
+
+    # Short polling window: wait for a selection for up to 2 minutes
+    def _selected_from_reactions(msg: dict) -> int | None:
+        reactions = {rv.get("name"): rv.get("count", 0) for rv in msg.get("reactions", [])}
+        # Handle multiple emoji name variants
+        if any(reactions.get(name, 0) > 0 for name in ("one", "keycap_1", "one")):
+            return 1
+        if any(reactions.get(name, 0) > 0 for name in ("two", "keycap_2", "two")):
+            return 2
+        if any(reactions.get(name, 0) > 0 for name in ("three", "keycap_3", "three")):
+            return 3
+        return None
+
+    start = time.time()
+    posted = False
+    while time.time() - start < 120:  # 2 minutes
+        parent = slack_get_message(channel, header_ts)
+        if parent:
+            # Parse tweet options from message text
+            parent_text = parent.get("text") or ""
+            lines = parent_text.splitlines()
+            tweet_options: dict[int, str] = {}
+            for i in (1, 2, 3):
+                # Simple extraction: line starting with marker
+                marker = f"{['','1️⃣','2️⃣','3️⃣'][i]} "
+                for line in lines:
+                    if line.strip().startswith(marker):
+                        tweet_options[i] = line.split(marker, 1)[1].strip()
+                        break
+            sel = _selected_from_reactions(parent)
+            if sel and sel in tweet_options and not posted:
+                try:
+                    tid = post_to_x(tweet_options[sel])
+                    slack_add_reaction(channel, header_ts, ROBOT_REACTION)
+                    slack_post(
+                        channel,
+                        f"{COACH_TAG} Posted option {sel} to X (id={tid})",
+                        thread_ts=header_ts,
+                    )
+                    posted = True
+                    break
+                except Exception as e:
+                    slack_post(channel, f"{COACH_TAG} Error posting to X: {e}", thread_ts=header_ts)
+                    break
+        time.sleep(5)
 
     # Monitor Creator Map and send urgent alerts (inline)
     alerts = monitor_creator_map()
@@ -1099,7 +1163,7 @@ def run_background_metrics() -> None:
     print("Background metrics fetch complete")
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
+def main(argv: Iterable[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--task",
