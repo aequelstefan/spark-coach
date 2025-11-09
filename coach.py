@@ -565,149 +565,207 @@ def generate_coaching_card() -> str:
     return "\n".join(lines)
 
 
-def run_suggest_and_monitor() -> None:
-    channel = env_required("SLACK_CHANNEL_ID")
+# ---- True Coach helpers ----
 
-    # Coaching card first
+
+def _reaction_selected(msg: dict, names: list[str]) -> bool:
+    reactions = {rv.get("name"): rv.get("count", 0) for rv in msg.get("reactions", [])}
+    return any(reactions.get(n, 0) > 0 for n in names)
+
+
+def _wait_for_user_response(
+    channel: str, ts: str, expected: dict[str, list[str]], timeout_sec: int = 1800
+) -> str | None:
+    """Poll Slack reactions on a message until one of the expected keys is reacted or timeout."""
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        parent = slack_get_message(channel, ts)
+        if parent:
+            for key, names in expected.items():
+                if _reaction_selected(parent, names):
+                    return key
+        time.sleep(5)
+    return None
+
+
+def _post_action_card(channel: str, number: int, total: int, title: str, body: str) -> str:
+    text = (
+        f"────────────────────────────────────\n"
+        f"ACTION #{number}: {title}\n"
+        f"────────────────────────────────────\n{body}"
+    )
+    _, ts = slack_post(channel, text)
+    return ts
+
+
+def _determine_morning_actions() -> list[dict]:
+    actions: list[dict] = []
+    urgent = _detect_urgent_opportunities()
+    if urgent:
+        # Parse first urgent item: format '@name — summary | Xm ago | N replies | tweet_id=12345'
+        first = urgent[0]
+        tid = None
+        user = None
+        summary = first
+        for part in first.split():
+            if part.startswith("tweet_id="):
+                tid = part.split("=", 1)[1]
+        if first.startswith("@"):  # get handle
+            user = first.split(" ", 1)[0].lstrip("@")
+        actions.append(
+            {
+                "type": "reply",
+                "tweet_id": tid,
+                "user": user,
+                "summary": summary,
+                "priority": "urgent",
+            }
+        )
+    # Always include tweet action
+    actions.insert(0, {"type": "tweet", "priority": "high"})
+    # Add up to 2 more high-value replies
+    try:
+        opps_pairs = _fetch_opportunities()
+        opps = [o for o, _ in opps_pairs][:3]
+        for o in opps:
+            actions.append(
+                {
+                    "type": "reply",
+                    "tweet_id": o.tweet_id,
+                    "user": o.user,
+                    "summary": o.summary,
+                    "priority": "high",
+                }
+            )
+    except Exception:
+        pass
+    return actions[:4]
+
+
+def run_morning_session() -> None:
+    channel = env_required("SLACK_CHANNEL_ID")
+    # Session header
     try:
         coaching = generate_coaching_card()
-        slack_post(channel, coaching)
-    except Exception as e:
-        _log_event({"type": "error", "where": "coaching_card", "error": str(e)})
+    except Exception:
+        coaching = f"{COACH_TAG} Morning session"
+    slack_post(channel, coaching)
 
-    today = dt.datetime.now(TZ).strftime("%Y-%m-%d")
-    suggestions = generate_suggestions()
-    tweets = _extract_tweets_from_suggestions(suggestions)
+    actions = _determine_morning_actions()
+    total = len(actions)
 
-    if not tweets:
-        print("No tweets generated, skipping post")
-        return
-
-    # Ensure we have exactly 3 tweets
-    while len(tweets) < 3:
-        tweets.append("[placeholder tweet]")
-    tweets = tweets[:3]
-
-    theme = _pick_theme()
-    # Build single message with all options
-    text = (
-        f"{COACH_TAG} Suggestions for {today}\nTODAY'S THEME: {theme.replace('_',' ').title()}\n\n"
-    )
-    text += f"1️⃣ {tweets[0]}\n\n"
-    text += f"2️⃣ {tweets[1]}\n\n"
-    text += f"3️⃣ {tweets[2]}\n\n"
-    text += "React: 1️⃣ 2️⃣ 3️⃣ to post now · ✏️ to edit · 👎 to skip"
-
-    ch, header_ts = slack_post(channel, text)
-    print(f"Posted suggestions to Slack at ts={header_ts}")
-
-    # Add numbered reactions immediately
-    try:
-        slack_add_reaction(channel, header_ts, "one")
-        slack_add_reaction(channel, header_ts, "two")
-        slack_add_reaction(channel, header_ts, "three")
-        slack_add_reaction(channel, header_ts, "pencil2")
-        slack_add_reaction(channel, header_ts, "thumbsdown")
-    except Exception as e:
-        print(f"Could not add reactions: {e}", file=sys.stderr)
-
-    # Short polling window: wait for a selection for up to 2 minutes
-    def _selected_from_reactions(msg: dict) -> int | None:
-        reactions = {rv.get("name"): rv.get("count", 0) for rv in msg.get("reactions", [])}
-        # Handle multiple emoji name variants
-        if any(reactions.get(name, 0) > 0 for name in ("one", "keycap_1", "one")):
-            return 1
-        if any(reactions.get(name, 0) > 0 for name in ("two", "keycap_2", "two")):
-            return 2
-        if any(reactions.get(name, 0) > 0 for name in ("three", "keycap_3", "three")):
-            return 3
-        return None
-
-    start = time.time()
-    posted = False
-    while time.time() - start < 120:  # 2 minutes
-        parent = slack_get_message(channel, header_ts)
-        if parent:
-            # Parse tweet options from message text
-            parent_text = parent.get("text") or ""
-            lines = parent_text.splitlines()
-            tweet_options: dict[int, str] = {}
-            for i in (1, 2, 3):
-                # Simple extraction: line starting with marker
-                marker = f"{['','1️⃣','2️⃣','3️⃣'][i]} "
-                for line in lines:
-                    if line.strip().startswith(marker):
-                        tweet_options[i] = line.split(marker, 1)[1].strip()
-                        break
-            sel = _selected_from_reactions(parent)
-            if sel and sel in tweet_options and not posted:
-                try:
-                    track_user_choice(sel, tweet_options[sel])
-                    tid = post_to_x(tweet_options[sel])
-                    slack_add_reaction(channel, header_ts, ROBOT_REACTION)
-                    slack_post(
-                        channel,
-                        f"{COACH_TAG} Posted option {sel} to X (id={tid})",
-                        thread_ts=header_ts,
-                    )
-                    posted = True
-                    break
-                except Exception as e:
-                    slack_post(channel, f"{COACH_TAG} Error posting to X: {e}", thread_ts=header_ts)
-                    break
-        time.sleep(5)
-
-    # Monitor Creator Map and send urgent alerts (inline)
-    alerts = monitor_creator_map()
-    for a in alerts:
-        slack_post(channel, f"{COACH_TAG} URGENT: {a}")
-
-    # Scan recent top-level messages for suggestion headers with numbered reactions
-    oldest = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).timestamp()
-    messages = slack_history(channel, oldest_ts=oldest, limit=200)
-    for m in messages:
-        parent_text = m.get("text") or ""
-        parent_ts = m.get("ts")
-        if not parent_ts:
-            continue
-        if COACH_TAG not in parent_text or "Suggestions for" not in parent_text:
-            continue
-        # Check if already posted (robot reaction)
-        reactions = {rv.get("name"): rv.get("count", 0) for rv in m.get("reactions", [])}
-        if reactions.get(ROBOT_REACTION, 0) > 0:
-            continue
-        # Parse tweet options from message text
-        lines = parent_text.splitlines()
-        tweet_options = {}
-        for line in lines:
-            if line.strip().startswith("1️⃣ "):
-                tweet_options[1] = line.split("1️⃣ ", 1)[1].strip()
-            elif line.strip().startswith("2️⃣ "):
-                tweet_options[2] = line.split("2️⃣ ", 1)[1].strip()
-            elif line.strip().startswith("3️⃣ "):
-                tweet_options[3] = line.split("3️⃣ ", 1)[1].strip()
-        # Check which number was reacted
-        selected = None
-        if reactions.get("one", 0) > 0:
-            selected = 1
-        elif reactions.get("two", 0) > 0:
-            selected = 2
-        elif reactions.get("three", 0) > 0:
-            selected = 3
-        if selected and selected in tweet_options:
-            tweet = tweet_options[selected]
+    for idx, action in enumerate(actions, start=1):
+        if action["type"] == "tweet":
+            # Ask before generating (cost control)
+            ts = _post_action_card(
+                channel,
+                idx,
+                total,
+                "POST YOUR MORNING TWEET",
+                "Shall I generate 3 options? React 👍 to generate · 👎 to skip",
+            )
+            # Try to add reactions (non-fatal)
             try:
-                tid = post_to_x(tweet)
-                slack_add_reaction(channel, parent_ts, ROBOT_REACTION)
-                slack_post(
-                    channel,
-                    f"{COACH_TAG} Posted option {selected} to X (id={tid})",
-                    thread_ts=parent_ts,
-                )
-                print(f"Posted option {selected} to X for Slack ts={parent_ts}")
+                slack_add_reaction(channel, ts, "+1")
+                slack_add_reaction(channel, ts, "thumbsdown")
+            except Exception:
+                pass
+            resp = _wait_for_user_response(
+                channel,
+                ts,
+                {"yes": ["+1", "thumbsup"], "no": ["thumbsdown"]},
+                timeout_sec=1800,
+            )
+            if resp != "yes":
+                continue
+            # Generate on-demand
+            suggestions = generate_suggestions()
+            tweets = _extract_tweets_from_suggestions(suggestions)[:3]
+            while len(tweets) < 3:
+                tweets.append("[placeholder tweet]")
+            opt_text = f"1️⃣ {tweets[0]}\n\n2️⃣ {tweets[1]}\n\n3️⃣ {tweets[2]}\n\nReact 1️⃣2️⃣3️⃣ to post"
+            _, opt_ts = slack_post(channel, opt_text)
+            try:
+                for r in ("one", "two", "three"):
+                    slack_add_reaction(channel, opt_ts, r)
+            except Exception:
+                pass
+            resp = _wait_for_user_response(
+                channel,
+                opt_ts,
+                {"1": ["one", "keycap_1"], "2": ["two", "keycap_2"], "3": ["three", "keycap_3"]},
+                timeout_sec=1800,
+            )
+            if resp in {"1", "2", "3"}:
+                choice = int(resp)
+                text = tweets[choice - 1]
+                try:
+                    track_user_choice(choice, text)
+                except Exception:
+                    pass
+                tid = post_to_x(text)
+                slack_post(channel, f"✅ Posted morning tweet (id={tid})")
+        elif action["type"] == "reply" and action.get("tweet_id"):
+            body = f"Target: @{action.get('user')}\nWhy: {action.get('summary')}\nDraft reply? 👍 yes · 👎 skip · ⏭️ next"
+            ts = _post_action_card(channel, idx, total, "REPLY TO HIGH-VALUE POST", body)
+            try:
+                for r in ("+1", "thumbsdown", "next_track_button"):
+                    slack_add_reaction(channel, ts, r)
+            except Exception:
+                pass
+            resp = _wait_for_user_response(
+                channel,
+                ts,
+                {"yes": ["+1", "thumbsup"], "no": ["thumbsdown"], "next": ["next_track_button"]},
+                timeout_sec=1800,
+            )
+            if resp != "yes":
+                continue
+            # Generate one draft on demand
+            try:
+                client = twitter_client_v2()
+                tw = client.get_tweet(id=action["tweet_id"], tweet_fields=["text"]).data
+                source_text = getattr(tw, "text", action.get("summary", ""))
+                draft = _generate_reply_single(source_text, action.get("user") or "user")
             except Exception as e:
-                slack_post(channel, f"{COACH_TAG} Error posting to X: {e}", thread_ts=parent_ts)
-                print(f"Error posting to X: {e}", file=sys.stderr)
+                slack_post(channel, f"{COACH_TAG} Failed to generate draft: {e}")
+                continue
+            draft_text = f"Draft:\n{draft}\n\nReact ✅ to post · ✏️ to edit (reply 'edit: ...') · 🔄 to regenerate · 👎 to skip"
+            _, dts = slack_post(channel, draft_text)
+            try:
+                for r in ("white_check_mark", "pencil2", "arrows_counterclockwise", "thumbsdown"):
+                    slack_add_reaction(channel, dts, r)
+            except Exception:
+                pass
+            resp = _wait_for_user_response(
+                channel,
+                dts,
+                {
+                    "post": ["white_check_mark", "heavy_check_mark"],
+                    "edit": ["pencil2"],
+                    "regen": ["arrows_counterclockwise"],
+                    "skip": ["thumbsdown"],
+                },
+                timeout_sec=1800,
+            )
+            if resp == "edit":
+                # Look for a thread reply starting with 'edit:'
+                edits = slack_thread_replies(channel, dts, limit=50)
+                for r in edits[::-1]:
+                    t = (r.get("text") or "").strip()
+                    if t.lower().startswith("edit:"):
+                        draft = t.split(":", 1)[1].strip()
+                        break
+                resp = "post"
+            if resp == "regen":
+                draft = _generate_reply_single(source_text, action.get("user") or "user")
+                slack_post(channel, f"Regenerated:\n{draft}")
+                resp = "post"
+            if resp == "post":
+                rid = reply_to_tweet(action["tweet_id"], draft, handle=action.get("user"))
+                slack_post(channel, f"✅ Posted reply (id={rid}) to @{action.get('user')}")
+
+    slack_post(channel, "🎉 MORNING SESSION COMPLETE — see you at 14:00 CET")
 
 
 def run_afternoon_bip() -> None:
@@ -1338,7 +1396,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("No task scheduled at this time")
         return 0
     elif args.task == "suggest":
-        run_suggest_and_monitor()
+        # True Coach morning session
+        run_morning_session()
     elif args.task == "afternoon":
         run_afternoon_bip()
     elif args.task == "scan":
