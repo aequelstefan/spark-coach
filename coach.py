@@ -368,7 +368,7 @@ def reply_to_tweet(tweet_id: str, text: str, *, handle: str | None = None) -> st
 
 
 def _detect_urgent_opportunities() -> list[str]:
-    """Detect urgent opportunities: AMA/Q&A posts <15min old with >20 replies."""
+    """Detect urgent opportunities: AMA/Q&A posts <5min old with >20 replies."""
     creators = _load_creators()
     tier1 = creators.get("tier1", [])
     if not tier1:
@@ -399,7 +399,7 @@ def _detect_urgent_opportunities() -> list[str]:
             if not created_at:
                 continue
             minutes_ago = (now - created_at).total_seconds() / 60
-            if minutes_ago > 15:
+            if minutes_ago > 5:
                 continue
             metrics = tw.public_metrics or {}
             replies = metrics.get("reply_count", 0)
@@ -553,7 +553,7 @@ def generate_coaching_card() -> str:
     ]
     if opps:
         for i, o in enumerate(opps, 1):
-            lines.append(f"{i+2}. @{o.user} — {o.summary} (score {o.score})")
+            lines.append(f"{i + 2}. @{o.user} — {o.summary} (score {o.score})")
     else:
         lines.append("- No high-value targets found yet")
     lines += [
@@ -768,15 +768,98 @@ def run_morning_session() -> None:
     slack_post(channel, "🎉 MORNING SESSION COMPLETE — see you at 14:00 CET")
 
 
-def run_afternoon_bip() -> None:
+def run_afternoon_session() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
-    text = (
-        f"{COACH_TAG} Build-in-public prompts for today\n"
-        "- Share progress update on current feature\n"
-        "- Show a behind-the-scenes screenshot\n"
-        "- Ask for feedback on a naming decision"
+    # Step 1: context refresh
+    _, ts = slack_post(
+        channel,
+        "🕑 AFTERNOON SESSION\nWhat did you ship/learn today?\nReply in this thread with 2-3 bullets, or react ⏭️ to skip.",
     )
-    slack_post(channel, text)
+    try:
+        slack_add_reaction(channel, ts, "next_track_button")
+    except Exception:
+        pass
+    # Wait up to 10 minutes for user text
+    deadline = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)
+    new_ctx = None
+    while dt.datetime.now(dt.timezone.utc) < deadline:
+        replies = slack_thread_replies(channel, ts, limit=50)
+        text_blobs = [r.get("text") or "" for r in replies if (r.get("text") or "").strip()]
+        if text_blobs:
+            new_ctx = "\n".join(text_blobs).strip()
+            break
+        # If user reacted skip, break
+        parent = slack_get_message(channel, ts)
+        if parent and any(
+            rv.get("name") == "next_track_button" and rv.get("count", 0) > 0
+            for rv in parent.get("reactions", [])
+        ):
+            break
+        time.sleep(10)
+    # Update weekly_context if provided
+    try:
+        prof = _load_voice_profile()
+        if new_ctx:
+            prof["weekly_context"] = new_ctx
+            _save_voice_profile(prof)
+            slack_post(channel, f"{COACH_TAG} Updated context saved.")
+        else:
+            new_ctx = prof.get("weekly_context") or prof.get("recent_work") or ""
+    except Exception:
+        new_ctx = new_ctx or ""
+
+    # Step 2: Ask to generate afternoon tweet
+    ats = _post_action_card(
+        channel,
+        1,
+        1,
+        "POST AFTERNOON UPDATE",
+        "Generate 3 options based on today’s context? React 👍 to generate · 👎 to skip",
+    )
+    try:
+        slack_add_reaction(channel, ats, "+1")
+        slack_add_reaction(channel, ats, "thumbsdown")
+    except Exception:
+        pass
+    resp = _wait_for_user_response(
+        channel, ats, {"yes": ["+1", "thumbsup"], "no": ["thumbsdown"]}, timeout_sec=1800
+    )
+    if resp != "yes":
+        slack_post(channel, "Afternoon session done. Monitoring for urgent opportunities.")
+        return
+
+    # Temporarily inject context into profile for this generation
+    prof = _load_voice_profile()
+    if new_ctx:
+        prof["weekly_context"] = new_ctx
+        _save_voice_profile(prof)
+    suggestions = generate_suggestions()
+    tweets = _extract_tweets_from_suggestions(suggestions)[:3]
+    while len(tweets) < 3:
+        tweets.append("[placeholder tweet]")
+    opt_text = f"1️⃣ {tweets[0]}\n\n2️⃣ {tweets[1]}\n\n3️⃣ {tweets[2]}\n\nReact 1️⃣2️⃣3️⃣ to post"
+    _, opt_ts = slack_post(channel, opt_text)
+    try:
+        for r in ("one", "two", "three"):
+            slack_add_reaction(channel, opt_ts, r)
+    except Exception:
+        pass
+    resp = _wait_for_user_response(
+        channel,
+        opt_ts,
+        {"1": ["one", "keycap_1"], "2": ["two", "keycap_2"], "3": ["three", "keycap_3"]},
+        timeout_sec=1800,
+    )
+    if resp in {"1", "2", "3"}:
+        choice = int(resp)
+        text = tweets[choice - 1]
+        try:
+            track_user_choice(choice, text)
+        except Exception:
+            pass
+        tid = post_to_x(text)
+        slack_post(channel, f"✅ Posted afternoon update (id={tid})")
+    slack_post(channel, "Afternoon session done. Monitoring for urgent opportunities.")
 
 
 def run_reply_engine() -> None:
@@ -1364,9 +1447,102 @@ def system_health_check() -> str:
     return "\n".join(lines)
 
 
+def _process_pending_number_posts() -> None:
+    """Watcher: if a suggestions/options message has 1️⃣/2️⃣/3️⃣ reactions later, post it."""
+    channel = env_required("SLACK_CHANNEL_ID")
+    oldest = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).timestamp()
+    messages = slack_history(channel, oldest_ts=oldest, limit=300)
+    for m in messages:
+        text = m.get("text") or ""
+        ts = m.get("ts")
+        if not ts or "1️⃣ " not in text or "2️⃣ " not in text or "3️⃣ " not in text:
+            continue
+        reactions = {rv.get("name"): rv.get("count", 0) for rv in m.get("reactions", [])}
+        if reactions.get(ROBOT_REACTION, 0) > 0:
+            continue
+        # Parse options
+        options: dict[int, str] = {}
+        for line in text.splitlines():
+            ls = line.strip()
+            if ls.startswith("1️⃣ "):
+                options[1] = ls.split("1️⃣ ", 1)[1].strip()
+            elif ls.startswith("2️⃣ "):
+                options[2] = ls.split("2️⃣ ", 1)[1].strip()
+            elif ls.startswith("3️⃣ "):
+                options[3] = ls.split("3️⃣ ", 1)[1].strip()
+        selected = (
+            1
+            if reactions.get("one", 0) > 0
+            else 2
+            if reactions.get("two", 0) > 0
+            else 3
+            if reactions.get("three", 0) > 0
+            else None
+        )
+        if selected and selected in options:
+            try:
+                tid = post_to_x(options[selected])
+                slack_add_reaction(channel, ts, ROBOT_REACTION)
+                slack_post(
+                    channel, f"{COACH_TAG} Posted option {selected} to X (id={tid})", thread_ts=ts
+                )
+            except Exception as e:
+                slack_post(channel, f"{COACH_TAG} Error posting to X: {e}", thread_ts=ts)
+
+
+def _update_learning_success_from_snapshot(tweet_id: str, metrics: dict) -> None:
+    """At 24h snapshot, update learning successes using logged features for that tweet."""
+    try:
+        data_dir = _ensure_data_dir()
+        path = os.path.join(data_dir, "log.jsonl")
+        feats: dict | None = None
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                ev = json.loads(line)
+                if (
+                    ev.get("type") == "post"
+                    and ev.get("kind") == "tweet"
+                    and ev.get("tweet_id") == tweet_id
+                ):
+                    feats = ev.get("features") or {}
+        if not feats:
+            return
+        likes = metrics.get("like_count", 0)
+        replies = metrics.get("reply_count", 0)
+        success = (likes >= 5) or (replies >= 1)
+        if not success:
+            return
+        s = _load_learning()
+        s.setdefault("features", {})
+        for key in ["has_numbers", "asks_question", "emoji_count", "len", "is_personal_story"]:
+            if feats.get(key) is None:
+                continue
+            d = s["features"].setdefault(key, {"picks": 0, "successes": 0, "weight": 0.5})
+            d["successes"] = d.get("successes", 0) + 1
+            # Recompute simple weight
+            picks = max(1, d.get("picks", 1))
+            d["weight"] = min(0.95, max(0.05, d["successes"] / picks))
+        _save_learning(s)
+    except Exception:
+        pass
+
+
 def run_background_metrics() -> None:
     """Run background metrics fetch (called every 30min by GitHub Actions)."""
+    # First, process any pending number-selected posts from options
+    try:
+        _process_pending_number_posts()
+    except Exception as e:
+        _log_event({"type": "error", "where": "watcher", "error": str(e)})
     _background_metrics_fetch()
+    # Update learning from 24h snapshots
+    try:
+        snaps = _get_recent_metrics()
+        for s in snaps:
+            if s.get("age_label") == "24h":
+                _update_learning_success_from_snapshot(str(s.get("tweet_id")), s.get("metrics", {}))
+    except Exception as e:
+        _log_event({"type": "error", "where": "learning_update", "error": str(e)})
     print("Background metrics fetch complete")
 
 
@@ -1399,7 +1575,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         # True Coach morning session
         run_morning_session()
     elif args.task == "afternoon":
-        run_afternoon_bip()
+        run_afternoon_session()
     elif args.task == "scan":
         run_opportunity_scan()
     elif args.task == "summary":
