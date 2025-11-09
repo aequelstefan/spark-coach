@@ -69,6 +69,30 @@ Personal brand growth on X requires:
 
 ## 3. Feature Set
 
+### 3.0 Voice Calibration (One-Time Setup)
+
+**Initial Setup (10 minutes, once):**
+1. Run: `python coach.py --task setup`
+2. Answer 8 questions in Slack about:
+   - Product description
+   - Recent work
+   - Writing style
+   - Example tweets
+   - Topics to avoid
+   - Growth goals
+3. System saves voice profile to data/voice_profile.json
+4. All content generation uses this profile
+
+**Weekly Refresh (2 minutes, Sundays):**
+- System asks: "What did you ship this week?"
+- User replies with 2-3 bullets
+- Updates voice_profile.json with weekly_context
+
+**Technical:**
+- Storage: data/voice_profile.json (git-ignored)
+- Cost: $0.05 one-time (Haiku for analysis)
+- Required: Must run before first use
+
 ### 3.1 Morning Suggestions (07:30 UTC → 08:30 CET)
 **User Flow:**
 1. System generates 3 tweet options via Claude (Sherry Jang voice)
@@ -105,6 +129,15 @@ Personal brand growth on X requires:
 - Tier 1 creators only (highest priority accounts)
 
 ### 3.3 Analytics & Reinforcement (18:00 UTC → 19:00 CET)
+
+**Coaching Card (Pre-Content):**
+Before showing tweet options, system posts daily strategy:
+- Must-do priorities (post timing, urgent opportunities)
+- High-value targets for today
+- Learning insights from last week
+- Theme selection reasoning
+
+Cost: $0.02/day (Haiku for coaching summary)
 **Daily Report (Separate Slack Thread):**
 - Tweet/reply counts (last 24h)
 - Latest metrics: likes, RTs, replies, impressions
@@ -122,6 +155,31 @@ Personal brand growth on X requires:
 - Top-performing tweet (engagement score)
 - Theme weight distribution
 - Zero LLM cost
+
+### 3.3.5 Enhanced Learning Loop
+
+**Multi-Dimensional Tracking:**
+System learns from your selections and edits:
+- Which options you pick (1️⃣2️⃣3️⃣)
+- What you edit before posting
+- Engagement metrics 24h later
+
+**Features Tracked:**
+| Feature | Example | Learning |
+|---------|---------|----------|
+| has_numbers | "Hit 247 users" | Tweets with metrics get 2.3x engagement |
+| asks_question | "What do you think?" | Questions drive 3x more replies |
+| is_personal_story | "shipped this week" | Stories outperform theory 1.8x |
+| length | 120-160 chars | Optimal length for engagement |
+| emoji_count | 0-1 emoji | 2+ reduces engagement |
+
+**Optimization Algorithm:**
+Thompson Sampling (Bayesian reinforcement learning)
+- Each variant has success/failure counts
+- System samples from beta distributions
+- Converges to optimal style in ~14 days
+
+**Cost:** $0 (pure math on stored data)
 
 ### 3.4 Creator Map (51 Accounts)
 **Tier 1 (16 accounts):** Always shown, urgent alerts enabled
@@ -227,6 +285,23 @@ spark-coach/
 ---
 
 ## 7. Risk Mitigation
+
+### 7.5 Health Monitoring
+
+**Daily Health Check (with analytics):**
+System reports:
+- Tasks completed today
+- Errors encountered
+- Learning progress
+- Alerts for failures
+
+**Auto-Recovery:**
+- Retry failed tasks 3x with backoff
+- Fall back to cached content if Claude down
+- Skip tasks gracefully, don't spam
+- Alert user only for critical failures
+
+**Cost:** $0 (pure logic)
 
 ### Guardrails
 1. **Budget cap:** $0.50/day hard limit via state.json tracking

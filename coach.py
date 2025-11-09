@@ -110,32 +110,58 @@ def _anthropic_complete(prompt: str, task: str) -> str:
     return "\n".join(content_parts).strip()
 
 
+def _voice_profile_path() -> str:
+    return os.path.join(_ensure_data_dir(), "voice_profile.json")
+
+
+def _load_voice_profile() -> dict:
+    try:
+        with open(_voice_profile_path(), encoding="utf-8") as f:
+            prof = json.load(f)
+            if not prof.get("product"):
+                raise ValueError("incomplete profile")
+            return prof
+    except Exception:
+        return {}
+
+
+def _save_voice_profile(p: dict) -> None:
+    p.setdefault("updated_at", dt.datetime.now(dt.timezone.utc).date().isoformat())
+    with open(_voice_profile_path(), "w", encoding="utf-8") as f:
+        json.dump(p, f, ensure_ascii=False, indent=2)
+
+
 def generate_suggestions() -> str:
-    """Call Claude to generate today's tweets + reply opportunities."""
-    style = os.getenv("ANTHROPIC_STYLE_CEO", _STYLE_CEO_DEFAULT)
-    topics = os.getenv(
-        "CONTENT_TOPICS",
-        (
-            "Company: Spark Coach — AI coach for social media. Focus only on: "
-            "building-in-public updates, cost optimization wins, automation workflows, "
-            "analytics + learning loop improvements, opportunity radar/replies strategy, CEO micro-moments."
-        ),
+    """Generate tweets using calibrated voice profile; error if profile missing."""
+    prof = _load_voice_profile()
+    if not prof:
+        return "- ERROR: Voice profile missing. Run: python coach.py --task setup"
+    name = prof.get("name", "")
+    handle = prof.get("handle", "")
+    product = prof.get("product", "")
+    recent_work = prof.get("recent_work", "")
+    contrarian = prof.get("contrarian_view", "")
+    style = prof.get("style", _STYLE_CEO_DEFAULT)
+    examples = (
+        "\n".join(f"- {t}" for t in (prof.get("example_tweets") or [])[:5]) or "- (no examples)"
     )
+    blocklist = ", ".join(prof.get("blocklist", [])) or "(none)"
+    banned = ", ".join(prof.get("banned_words", [])) or "(none)"
+    weekly_ctx = prof.get("weekly_context") or recent_work
+
     prompt = (
-        "You are my social writing partner. Follow this style strictly:\n"
-        + style
-        + "\nContext and constraints:\n"
-        + topics
-        + "\nDo NOT write generic motivation or advice. Make it specific to what we shipped this week.\n"
-        + "\nGenerate content for today. Output EXACTLY two sections with bullets only:\n"
-        "Tweets:\n"
-        "- Three tweet options written in the above style (2–4 short lines each).\n"
-        "Reply Opportunities:\n"
-        "- Three brief targets (handle + one‑line why).\n"
-        "Constraints: avoid hype words (e.g., 'first principles'), everyday language, one emoji max per tweet."
+        f"You are writing tweets for {name} (@{handle}).\n\n"
+        f"CONTEXT:\nProduct: {product}\nRecent work: {recent_work}\nKey insight: {contrarian}\n\n"
+        f"VOICE STYLE:\n{style}\n\n"
+        f"EXAMPLES TO LEARN FROM:\n{examples}\n\n"
+        f"NEVER WRITE ABOUT:\n{blocklist}\n\n"
+        f"NEVER USE THESE WORDS:\n{banned}\n\n"
+        f"CURRENT WEEK CONTEXT:\n{weekly_ctx}\n\n"
+        "Generate 3 tweet options about their CURRENT WORK.\n"
+        "Use their voice. Reference their actual product updates.\nBe specific with numbers/data when available.\n"
+        "Output EXACTLY two sections with bullets only:\nTweets:\n- three options\nReply Opportunities:\n- three targets (handle + one line why)."
     )
-    text = _anthropic_complete(prompt, task="suggest")
-    return text or "- (no suggestions returned)"
+    return _anthropic_complete(prompt, task="suggest") or "- (no suggestions returned)"
 
 
 # ---- Slack helpers ----
@@ -450,8 +476,104 @@ def _pick_theme() -> str:
     return theme
 
 
+def _learning_path() -> str:
+    return os.path.join(_ensure_data_dir(), "learning.json")
+
+
+def _load_learning() -> dict:
+    try:
+        with open(_learning_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"features": {}, "updated_at": dt.datetime.now(dt.timezone.utc).date().isoformat()}
+
+
+def _save_learning(s: dict) -> None:
+    s["updated_at"] = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    with open(_learning_path(), "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+
+def track_user_choice(option_idx: int, text: str) -> None:
+    s = _load_learning()
+    feats = _text_features(text)
+    feats["is_personal_story"] = any(w in text.lower() for w in ["i ", " we ", "shipped", "today "])
+    s.setdefault("features", {})
+    for key in ["has_numbers", "asks_question", "emoji_count", "len", "is_personal_story"]:
+        d = s["features"].setdefault(key, {"picks": 0, "successes": 0, "weight": 0.5})
+        d["picks"] += 1
+        d["weight"] = min(0.95, d.get("weight", 0.5) * 0.99 + (1 if feats.get(key) else 0) * 0.01)
+    _save_learning(s)
+
+
+def generate_learning_insights() -> str:
+    s = _load_learning()
+    out: list[str] = []
+    for feat, d in s.get("features", {}).items():
+        if d.get("weight", 0) > 0.7:
+            out.append(f"✅ {feat}: {d['weight']:.0%} success rate")
+    return "\n".join(out[:3])
+
+
+def generate_coaching_card() -> str:
+    now_cet = dt.datetime.now(TZ)
+    hour = now_cet.hour
+    if 8 <= hour <= 10:
+        timing = "NOW"
+    elif hour < 8:
+        timing = f"in {8 - hour} hours"
+    else:
+        timing = "later today"
+
+    urgent = _detect_urgent_opportunities()[:1]
+
+    try:
+        opps_pairs = _fetch_opportunities()
+        opps = [o for o, _ in opps_pairs][:3]
+    except Exception:
+        opps = []
+
+    insights = generate_learning_insights() or "(learning in progress)"
+
+    picked_theme = _pick_theme().replace("_", " ").title()
+
+    lines = [
+        "🎯 MORNING SESSION - Stefan's To-Do List",
+        "",
+        f"MUST DO ({timing}):",
+        "1. Post morning tweet (optimal window)",
+    ]
+    if urgent:
+        lines.append(f"2. Urgent reply: {urgent[0]}")
+    else:
+        lines.append("2. —")
+    lines += [
+        "",
+        "HIGH VALUE (today):",
+    ]
+    if opps:
+        for i, o in enumerate(opps, 1):
+            lines.append(f"{i+2}. @{o.user} — {o.summary} (score {o.score})")
+    else:
+        lines.append("- No high-value targets found yet")
+    lines += [
+        "",
+        f"TODAY'S THEME: {picked_theme}",
+        "LAST WEEK INSIGHT:",
+        insights,
+    ]
+    return "\n".join(lines)
+
+
 def run_suggest_and_monitor() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
+
+    # Coaching card first
+    try:
+        coaching = generate_coaching_card()
+        slack_post(channel, coaching)
+    except Exception as e:
+        _log_event({"type": "error", "where": "coaching_card", "error": str(e)})
 
     today = dt.datetime.now(TZ).strftime("%Y-%m-%d")
     suggestions = generate_suggestions()
@@ -520,6 +642,7 @@ def run_suggest_and_monitor() -> None:
             sel = _selected_from_reactions(parent)
             if sel and sel in tweet_options and not posted:
                 try:
+                    track_user_choice(sel, tweet_options[sel])
                     tid = post_to_x(tweet_options[sel])
                     slack_add_reaction(channel, header_ts, ROBOT_REACTION)
                     slack_post(
@@ -1080,6 +1203,12 @@ def run_summary() -> None:
 
     # Post in separate thread
     slack_post(channel, text)
+    try:
+        health = system_health_check()
+        if health:
+            slack_post(channel, health)
+    except Exception as e:
+        _log_event({"type": "error", "where": "health_check", "error": str(e)})
 
 
 def run_weekly_brief() -> None:
@@ -1157,6 +1286,26 @@ def run_learning_loop() -> None:
     pass
 
 
+def system_health_check() -> str:
+    try:
+        oldest = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).timestamp()
+        messages = slack_history(env_required("SLACK_CHANNEL_ID"), oldest_ts=oldest, limit=100)
+        morning = any("Suggestions for" in (m.get("text") or "") for m in messages)
+    except Exception:
+        morning = False
+    posts = _collect_recent_posts(24)
+    tweets = [p for p in posts if p.get("kind") == "tweet"]
+    replies = [p for p in posts if p.get("kind") == "reply"]
+    metrics_ok = bool(_get_recent_metrics())
+    lines = [
+        "🏥 SYSTEM HEALTH",
+        f"{'✅' if morning else '⚠️'} Morning: {'Found suggestions' if morning else 'Missing'}",
+        f"✅ Posts: {len(tweets)} tweets, {len(replies)} replies (24h)",
+        f"{'✅' if metrics_ok else '⚠️'} Metrics: {'ok' if metrics_ok else 'no snapshots'}",
+    ]
+    return "\n".join(lines)
+
+
 def run_background_metrics() -> None:
     """Run background metrics fetch (called every 30min by GitHub Actions)."""
     _background_metrics_fetch()
@@ -1177,6 +1326,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             "recs",
             "stats",
             "metrics",
+            "setup",
+            "refresh",
             "none",
         ],
         default="suggest",
@@ -1204,6 +1355,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         run_ad_hoc_stats()
     elif args.task == "metrics":
         run_background_metrics()
+    elif args.task == "setup":
+        try:
+            from spark_coach.setup import run_setup_interview
+
+            run_setup_interview()
+        except Exception as e:
+            print(f"Setup failed: {e}", file=sys.stderr)
+    elif args.task == "refresh":
+        try:
+            from spark_coach.setup import run_weekly_refresh_prompt
+
+            run_weekly_refresh_prompt()
+        except Exception as e:
+            print(f"Refresh failed: {e}", file=sys.stderr)
     run_learning_loop()
     return 0
 

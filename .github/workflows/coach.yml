@@ -45,6 +45,8 @@ jobs:
           if [ "$hour" = "13" ] && [ "$min" = "00" ]; then task="afternoon"; fi
           if [ "$hour" = "18" ] && [ "$min" = "00" ]; then task="summary"; fi
           if [ "$dow" = "7" ] && [ "$hour" = "19" ] && [ "$min" = "00" ]; then task="weekly"; fi
+          # Sunday 19:05 UTC - prompt weekly refresh
+          if [ "$dow" = "7" ] && [ "$hour" = "19" ] && [ "$min" = "05" ]; then task="refresh"; fi
           # Scan only at 09:00, 12:00, 15:30 UTC
           if [ "$hour" = "09" ] && [ "$min" = "00" ]; then task="scan"; fi
           if [ "$hour" = "12" ] && [ "$min" = "00" ]; then task="scan"; fi
