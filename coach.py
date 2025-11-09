@@ -568,6 +568,26 @@ def generate_coaching_card() -> str:
 # ---- True Coach helpers ----
 
 
+def wait_for_user_reaction(
+    channel: str, ts: str, valid_reactions: list[str], timeout: int = 1800
+) -> str | None:
+    """Compatibility wrapper that supports multiple emoji name variants."""
+    # Map variants to canonical names
+    variant_map = {
+        "thumbsup": ["thumbsup", "+1"],
+        "thumbsdown": ["thumbsdown", "-1"],
+        "one": ["one", "keycap_1"],
+        "two": ["two", "keycap_2"],
+        "three": ["three", "keycap_3"],
+        "fast_forward": ["fast_forward", "next_track_button"],
+        "pencil2": ["pencil2"],
+    }
+    expected: dict[str, list[str]] = {}
+    for key in valid_reactions:
+        expected[key] = variant_map.get(key, [key])
+    return _wait_for_user_response(channel, ts, expected, timeout)
+
+
 def _reaction_selected(msg: dict, names: list[str]) -> bool:
     reactions = {rv.get("name"): rv.get("count", 0) for rv in msg.get("reactions", [])}
     return any(reactions.get(n, 0) > 0 for n in names)
