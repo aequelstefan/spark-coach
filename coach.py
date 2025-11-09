@@ -203,11 +203,25 @@ def slack_thread_replies(channel: str, thread_ts: str, limit: int = 100) -> list
 
 
 def slack_get_message(channel: str, ts: str) -> dict | None:
-    """Fetch a single message (parent) including reactions."""
+    """Fetch a single message (best-effort, exact by ts)."""
     client = slack_client()
-    resp = client.conversations_replies(channel=channel, ts=ts, limit=1)
-    msgs = list(resp.get("messages", []))
-    return msgs[0] if msgs else None
+    # Prefer an exact history window so we can read reactions on reply messages
+    try:
+        resp = client.conversations_history(
+            channel=channel, latest=ts, oldest=ts, inclusive=True, limit=1
+        )
+        msgs = list(resp.get("messages", []))
+        if msgs and msgs[0].get("ts") == ts:
+            return msgs[0]
+    except Exception:
+        pass
+    # Fallback to replies when ts is the parent thread
+    try:
+        resp = client.conversations_replies(channel=channel, ts=ts, limit=1)
+        msgs = list(resp.get("messages", []))
+        return msgs[0] if msgs else None
+    except Exception:
+        return None
 
 
 # ---- X (Twitter) ----
