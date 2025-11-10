@@ -9,8 +9,8 @@ from slack_sdk.errors import SlackApiError
 
 def _data_dir() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    # coach.py stores data at repo_root/../../data relative to this file as well
-    data_dir = os.path.abspath(os.path.join(root, "..", "..", "..", "data"))
+    # Data directory lives at repo_root/data; from src/spark_coach that's ../../data
+    data_dir = os.path.abspath(os.path.join(root, "..", "..", "data"))
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
 
@@ -57,6 +57,8 @@ QUESTIONS = [
     ("goal", "Q8: What's your growth goal? (X followers in Y days)"),
 ]
 
+_QNUM_TO_KEY = {f"q{i}": key for i, (key, _t) in enumerate(QUESTIONS, start=1)}
+
 
 def run_setup_interview(channel_env: str = "SLACK_CHANNEL_ID") -> None:
     channel = os.getenv(channel_env)
@@ -65,56 +67,82 @@ def run_setup_interview(channel_env: str = "SLACK_CHANNEL_ID") -> None:
 
     header = (
         "[coach] Voice calibration interview (8 questions)\n"
-        "Reply to this thread with your answers. I will compile your voice profile."
+        "Reply to this thread with your answers. You can answer one-by-one or paste all at once using Q1:/Q2:/... prefixes."
     )
     ch, ts = slack_post(channel, header)
 
     answers: dict[str, object] = {}
+    # Post all questions once
     for _key, q in QUESTIONS:
         slack_post(channel, q, thread_ts=ts)
 
-    # Wait up to ~10 minutes for answers (poll every 20s)
+    # Wait up to ~10 minutes for answers (poll every 10s)
     import time
 
     deadline = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)
-    asked = {k for k, _ in QUESTIONS}
-    while dt.datetime.now(dt.timezone.utc) < deadline and asked:
+
+    def _parse_block(text: str) -> None:
+        import re as _re
+
+        blob = text.strip()
+        if not blob:
+            return
+        # Parse Qn: sections if present (multi-answer paste)
+        pattern = _re.compile(r"(?im)^q(\d)\s*:\s*(.*?)(?=^q\d\s*:|\Z)", _re.DOTALL)
+        found = list(pattern.finditer(blob))
+        if found:
+            for m in found:
+                idx = int(m.group(1))
+                val = m.group(2).strip()
+                key = QUESTIONS[idx - 1][0] if 1 <= idx <= len(QUESTIONS) else None
+                if not key:
+                    continue
+                if key == "example_tweets":
+                    parts: list[str] = []
+                    for _ln in val.splitlines():
+                        t = _ln.lstrip().lstrip("-").lstrip("•").strip()
+                        if t:
+                            parts.append(t)
+                    answers[key] = parts
+                elif key in ("blocklist", "banned_words"):
+                    parts = [p.strip() for p in val.replace(",", "\n").splitlines() if p.strip()]
+                    answers[key] = parts
+                else:
+                    answers[key] = val
+            return
+        # Otherwise try to detect single Qn: prefix
+        for idx, (key, _q) in enumerate(QUESTIONS, start=1):
+            tag = f"q{idx}"
+            if blob.lower().startswith(f"{tag}:") or blob.lower().startswith(f"{tag} "):
+                val = blob.split(":", 1)[1].strip() if ":" in blob else blob[len(tag) :].strip()
+                if key == "example_tweets":
+                    parts: list[str] = []
+                    for _ln in val.splitlines():
+                        t = _ln.lstrip().lstrip("-").lstrip("•").strip()
+                        if t:
+                            parts.append(t)
+                    answers[key] = parts
+                elif key in ("blocklist", "banned_words"):
+                    parts = [p.strip() for p in val.replace(",", "\n").splitlines() if p.strip()]
+                    answers[key] = parts
+                else:
+                    answers[key] = val
+                return
+
+    while dt.datetime.now(dt.timezone.utc) < deadline:
         replies = slack_thread_replies(channel, ts, limit=200)
-        # parse latest answer for each key heuristically by prefix (Q1/Q2/etc) or by order
         for r in replies:
             text = (r.get("text") or "").strip()
             if not text:
                 continue
-            for idx, (key, _q) in enumerate(QUESTIONS, start=1):
-                tag = f"q{idx}"  # allow lowercase q1, q2
-                if text.lower().startswith(f"{tag}:") or text.lower().startswith(f"{tag} "):
-                    val = text.split(":", 1)[1].strip() if ":" in text else text[len(tag) :].strip()
-                    if key in ("example_tweets",):
-                        # split by newlines or bullets
-                        parts: list[str] = []
-                        for _ln in val.splitlines():
-                            t = _ln.lstrip()
-                            t = t.lstrip("-")
-                            t = t.lstrip("•")
-                            t = t.lstrip()
-                            s = t.strip()
-                            if s:
-                                parts.append(s)
-                        answers[key] = parts
-                    elif key in ("blocklist", "banned_words"):
-                        parts = [
-                            p.strip() for p in val.replace(",", "\n").splitlines() if p.strip()
-                        ]
-                        answers[key] = parts
-                    else:
-                        answers[key] = val
-        # if still missing, also capture first N freeform replies in order
-        missing = [k for k in asked if k not in answers]
-        if not missing:
+            _parse_block(text)
+        # Check if we have all required core fields
+        required = ["product", "recent_work", "contrarian_view", "style"]
+        if all(k in answers and answers[k] for k in required):
             break
-        time.sleep(20)
+        time.sleep(10)
 
-    # Build profile
+    # Build profile with sensible defaults
     now = dt.datetime.now(dt.timezone.utc).date().isoformat()
     profile = {
         "name": os.getenv("PROFILE_NAME", "Stefan"),
@@ -124,6 +152,7 @@ def run_setup_interview(channel_env: str = "SLACK_CHANNEL_ID") -> None:
         "contrarian_view": answers.get("contrarian_view", ""),
         "style": answers.get("style", ""),
         "example_tweets": answers.get("example_tweets", []),
+        "examples": answers.get("example_tweets", []),
         "blocklist": answers.get("blocklist", []),
         "banned_words": answers.get("banned_words", []),
         "goal": answers.get("goal", ""),
@@ -131,11 +160,30 @@ def run_setup_interview(channel_env: str = "SLACK_CHANNEL_ID") -> None:
         "updated_at": now,
     }
 
-    path = _voice_path()
-    with open(path, "w", encoding="utf-8") as f:
+    # Validation feedback
+    missing = [k for k in ["product", "recent_work", "style"] if not profile.get(k)]
+    if missing:
+        slack_post(
+            channel,
+            f"⚠️ Missing fields: {', '.join(missing)}. You can reply here with Q1:/Q2: etc to add them anytime.",
+            thread_ts=ts,
+        )
+
+    with open(_voice_path(), "w", encoding="utf-8") as f:
         json.dump(profile, f, ensure_ascii=False, indent=2)
 
-    slack_post(channel, f"[coach] Voice profile saved to {path}.", thread_ts=ts)
+    # Confirmation summary
+    summary_lines = [
+        "✅ VOICE CALIBRATION SAVED",
+        f"Product: {profile.get('product') or '(missing)'}",
+        f"Recent work: {profile.get('recent_work') or '(missing)'}",
+        f"Style: {profile.get('style') or '(missing)'}",
+        f"Examples: {len(profile.get('example_tweets', []))} tweets",
+        f"Blocklist: {', '.join(profile.get('blocklist', [])) or '(none)'}",
+        f"Banned: {', '.join(profile.get('banned_words', [])) or '(none)'}",
+        f"Goal: {profile.get('goal') or '(missing)'}",
+    ]
+    slack_post(channel, "\n".join(summary_lines), thread_ts=ts)
 
 
 def run_weekly_refresh_prompt() -> None:
@@ -145,7 +193,16 @@ def run_weekly_refresh_prompt() -> None:
         raise RuntimeError("Missing SLACK_CHANNEL_ID for weekly refresh")
 
     ch, ts = slack_post(
-        channel, "🔄 WEEKLY REFRESH (2 min): What did you ship this week? Reply with 2-3 bullets."
+        channel,
+        """
+🔄 WEEKLY REFRESH (2 min)
+
+What did you ship/learn this week? 2–3 bullets preferred.
+Examples:
+- Shipped AI personalization (40% faster onboarding)
+- 5 user interviews on retention
+- New positioning test for guilt-free giving
+""".strip(),
     )
     import time
 
@@ -154,11 +211,10 @@ def run_weekly_refresh_prompt() -> None:
     weekly_context = None
     while dt.datetime.now(dt.timezone.utc) < deadline:
         replies = slack_thread_replies(channel, ts, limit=50)
-        if replies:
-            text = "\n".join([r.get("text") or "" for r in replies]).strip()
-            if text:
-                weekly_context = text
-                break
+        text = "\n".join([r.get("text") or "" for r in replies]).strip()
+        if text:
+            weekly_context = text
+            break
         time.sleep(20)
 
     # Update profile
@@ -167,9 +223,21 @@ def run_weekly_refresh_prompt() -> None:
             profile = json.load(f)
     except Exception:
         profile = {}
-    profile["weekly_context"] = weekly_context or ""
+    if weekly_context:
+        profile["weekly_context"] = weekly_context
+        profile["weekly_context_updated"] = dt.datetime.now(dt.timezone.utc).isoformat()
     profile["updated_at"] = dt.datetime.now(dt.timezone.utc).date().isoformat()
     with open(_voice_path(), "w", encoding="utf-8") as f:
         json.dump(profile, f, ensure_ascii=False, indent=2)
+
+    slack_post(
+        channel,
+        (
+            "✅ Weekly context updated."
+            if weekly_context
+            else "⚠️ No response; using last week’s context."
+        ),
+        thread_ts=ts,
+    )
 
     slack_post(channel, "[coach] Weekly context updated.", thread_ts=ts)

@@ -676,6 +676,81 @@ def _determine_morning_actions() -> list[dict]:
     return actions[:4]
 
 
+def _creators_all() -> list[str]:
+    try:
+        c = _load_creators()
+        return list(dict.fromkeys(c.get("tier1", []) + c.get("tier2", []) + c.get("tier3", [])))
+    except Exception:
+        return []
+
+
+def follow_user(handle: str) -> bool:
+    """Follow a user by handle via Twitter API v1. Returns True on success."""
+    try:
+        api = twitter_api_v1()
+        api.create_friendship(screen_name=handle)
+        return True
+    except Exception as e:
+        _log_event({"type": "error", "where": "follow_user", "handle": handle, "error": str(e)})
+        return False
+
+
+def follow_icp_batch(limit: int = 10) -> list[str]:
+    """Follow up to `limit` accounts from creators.json that we don't already follow."""
+    try:
+        api = twitter_api_v1()
+        me = api.me()
+        # current friends ids
+        friend_ids = set(api.get_friend_ids(user_id=me.id))
+        # resolve usernames to ids
+        all_handles = _creators_all()
+        if not all_handles:
+            return []
+        client = twitter_client_v2()
+        users = client.get_users(usernames=all_handles).data or []
+        queue: list[str] = []
+        for u in users:
+            if getattr(u, "id", None) and int(u.id) not in friend_ids:
+                queue.append(u.username)
+        followed: list[str] = []
+        for h in queue[:limit]:
+            if follow_user(h):
+                followed.append(h)
+        return followed
+    except Exception as e:
+        _log_event({"type": "error", "where": "follow_icp_batch", "error": str(e)})
+        return []
+
+
+def _run_follow_icp_card(channel: str) -> None:
+    """Post a card to approve following 10 ICP accounts today."""
+    text = (
+        "ICP growth: follow 10 high-signal founders now?\n"
+        "✅ to follow · 👎 to skip (rate-limited, 10/day)"
+    )
+    _, ts = slack_post(channel, text)
+    try:
+        slack_add_reaction(channel, ts, "white_check_mark")
+        slack_add_reaction(channel, ts, "thumbsdown")
+    except Exception:
+        pass
+    choice = wait_for_user_reaction(
+        channel, ts, ["thumbsup", "thumbsdown", "white_check_mark"], timeout=900
+    )
+    if choice in ("thumbsup", "white_check_mark"):
+        followed = follow_icp_batch(limit=10)
+        if followed:
+            slack_post(channel, f"✅ Followed: {', '.join('@'+h for h in followed)}", thread_ts=ts)
+        else:
+            slack_post(
+                channel,
+                "⚠️ No new accounts to follow (already following or lookup failed)",
+                thread_ts=ts,
+            )
+    elif choice == "thumbsdown":
+        slack_post(channel, "⏭️ Skipped following ICP today", thread_ts=ts)
+
+
 def run_morning_session() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
     # Session header
@@ -684,6 +759,12 @@ def run_morning_session() -> None:
     except Exception:
         coaching = f"{COACH_TAG} Morning session"
     slack_post(channel, coaching)
+
+    # Optional: Follow ICP batch (approval)
+    try:
+        _run_follow_icp_card(channel)
+    except Exception as e:
+        _log_event({"type": "error", "where": "follow_card", "error": str(e)})
 
     actions = _determine_morning_actions()
     total = len(actions)
