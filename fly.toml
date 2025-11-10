@@ -1,0 +1,13 @@
+app = "spark-coach"
+primary_region = "ams"
+
+[build]
+
+[env]
+  DAILY_TOKEN_BUDGET_USD = "0.50"
+  REPLIES_SINGLE_VARIANT = "true"
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
