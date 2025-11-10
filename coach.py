@@ -740,7 +740,9 @@ def _run_follow_icp_card(channel: str) -> None:
     if choice in ("thumbsup", "white_check_mark"):
         followed = follow_icp_batch(limit=10)
         if followed:
-            slack_post(channel, f"✅ Followed: {', '.join('@'+h for h in followed)}", thread_ts=ts)
+            slack_post(
+                channel, f"✅ Followed: {', '.join('@' + h for h in followed)}", thread_ts=ts
+            )
         else:
             slack_post(
                 channel,
@@ -771,34 +773,12 @@ def run_morning_session() -> None:
 
     for idx, action in enumerate(actions, start=1):
         if action["type"] == "tweet":
-            # Ask before generating (cost control)
-            ts = _post_action_card(
-                channel,
-                idx,
-                total,
-                "POST YOUR MORNING TWEET",
-                "Shall I generate 3 options? React 👍 to generate · 👎 to skip",
-            )
-            # Try to add reactions (non-fatal)
-            try:
-                slack_add_reaction(channel, ts, "+1")
-                slack_add_reaction(channel, ts, "thumbsdown")
-            except Exception:
-                pass
-            resp = _wait_for_user_response(
-                channel,
-                ts,
-                {"yes": ["+1", "thumbsup"], "no": ["thumbsdown"]},
-                timeout_sec=1800,
-            )
-            if resp != "yes":
-                continue
-            # Generate on-demand
+            # Generate tweets immediately
             suggestions = generate_suggestions()
             tweets = _extract_tweets_from_suggestions(suggestions)[:3]
             while len(tweets) < 3:
                 tweets.append("[placeholder tweet]")
-            opt_text = f"1️⃣ {tweets[0]}\n\n2️⃣ {tweets[1]}\n\n3️⃣ {tweets[2]}\n\nReact 1️⃣2️⃣3️⃣ to post"
+            opt_text = f"🎯 MORNING TWEET OPTIONS\n\n1️⃣ {tweets[0]}\n\n2️⃣ {tweets[1]}\n\n3️⃣ {tweets[2]}\n\nReact 1️⃣2️⃣3️⃣ to post"
             _, opt_ts = slack_post(channel, opt_text)
             try:
                 for r in ("one", "two", "three"):
