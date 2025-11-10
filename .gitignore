@@ -9,7 +9,8 @@ __pycache__/
 .pytest_cache/
 
 # Runtime data (state + logs)
-data/
+data/*
+!data/voice_profile.json
 
 # Editor/OS
 .DS_Store

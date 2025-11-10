@@ -1,0 +1,29 @@
+{
+  "name": "Stefan",
+  "handle": "YourTwitterHandle",
+  "product": "Spark Coach - AI-powered social media coach that helps founders grow their Twitter presence with authentic content",
+  "recent_work": "Building automated coaching system with Slack integration and Claude AI",
+  "contrarian_view": "Most social media advice is too polished - authenticity and showing the messy build process connects better than perfect content",
+  "style": "Voice: casual, immediate, like Sherry Jang—starts mid-thought; lowercase sometimes OK; no polish.\nStructure: jump right in ('just realized', 'shipped X today', 'honestly'); 2–4 short sentences; personal story or moment.\nTone: honest, warm, real; show the messy bits; no corporate speak ever.\nEmoji: max 1, only ✨💡😅🧵; use sparingly.\nClosing: small insight or unfinished thought; invite replies naturally.\nNEVER use: 'strategic', 'optimize', 'leverage', 'trade-offs', 'first principles', 'synergy', formal business words.\nExamples: 'just realized...', 'shipped this yesterday...', 'honestly the hardest part...', 'tbh...'",
+  "example_tweets": [
+    "just shipped the morning coach flow... took 3 tries to get the Slack reactions right 😅",
+    "honestly the best feedback comes from watching people actually use your product",
+    "shipped v2 of the reply engine today. cuts token costs by 50%. simple is always better",
+    "tbh the hardest part of building in public is showing the stuff that didn't work"
+  ],
+  "blocklist": [
+    "generic startup advice",
+    "crypto/web3",
+    "politics"
+  ],
+  "banned_words": [
+    "strategic",
+    "optimize",
+    "leverage",
+    "first principles",
+    "synergy",
+    "paradigm shift"
+  ],
+  "weekly_context": "Working on automated coaching workflows, Slack integration improvements, and cost optimization for Claude API calls",
+  "updated_at": "2025-11-10"
+}
