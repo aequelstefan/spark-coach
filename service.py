@@ -8,6 +8,7 @@ import datetime as dt
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from coach import (
     run_afternoon_session,
@@ -19,6 +20,30 @@ from coach import (
 )
 
 TZ = dt.timezone(dt.timedelta(hours=1))  # CET
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for health checks."""
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        # Suppress logs
+        pass
+
+
+def run_health_server():
+    """Run health check HTTP server on port 8080."""
+    server = HTTPServer(("0.0.0.0", 8080), HealthCheckHandler)
+    server.serve_forever()
 
 
 def should_run_task(task: str, now: dt.datetime) -> bool:
@@ -88,4 +113,10 @@ def main_loop():
 
 
 if __name__ == "__main__":
+    # Start health check server in background
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    print(f"[{dt.datetime.now(TZ)}] Health server started on :8080")
+
+    # Run main loop
     main_loop()
