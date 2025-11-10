@@ -755,110 +755,65 @@ def _run_follow_icp_card(channel: str) -> None:
 
 def run_morning_session() -> None:
     channel = env_required("SLACK_CHANNEL_ID")
-    # Session header
-    try:
-        coaching = generate_coaching_card()
-    except Exception:
-        coaching = f"{COACH_TAG} Morning session"
-    slack_post(channel, coaching)
 
-    # Optional: Follow ICP batch (approval)
+    # STEP 1: Generate and show 3 tweet options immediately
+    slack_post(channel, "🎯 MORNING SESSION\n\nGenerating tweet options...")
     try:
-        _run_follow_icp_card(channel)
+        suggestions = generate_suggestions()
+        tweets = _extract_tweets_from_suggestions(suggestions)[:3]
+        while len(tweets) < 3:
+            tweets.append("[placeholder tweet]")
     except Exception as e:
-        _log_event({"type": "error", "where": "follow_card", "error": str(e)})
+        slack_post(channel, f"❌ Error generating tweets: {e}")
+        return
 
-    actions = _determine_morning_actions()
-    total = len(actions)
+    opt_text = f"**STEP 1: Pick your tweet**\n\n1️⃣ {tweets[0]}\n\n2️⃣ {tweets[1]}\n\n3️⃣ {tweets[2]}\n\nReact 1️⃣2️⃣3️⃣ to post · or reply 'edit 1: your text' to customize"
+    _, opt_ts = slack_post(channel, opt_text)
+    try:
+        for r in ("one", "two", "three"):
+            slack_add_reaction(channel, opt_ts, r)
+    except Exception:
+        pass
 
-    for idx, action in enumerate(actions, start=1):
-        if action["type"] == "tweet":
-            # Generate tweets immediately
-            suggestions = generate_suggestions()
-            tweets = _extract_tweets_from_suggestions(suggestions)[:3]
-            while len(tweets) < 3:
-                tweets.append("[placeholder tweet]")
-            opt_text = f"🎯 MORNING TWEET OPTIONS\n\n1️⃣ {tweets[0]}\n\n2️⃣ {tweets[1]}\n\n3️⃣ {tweets[2]}\n\nReact 1️⃣2️⃣3️⃣ to post"
-            _, opt_ts = slack_post(channel, opt_text)
-            try:
-                for r in ("one", "two", "three"):
-                    slack_add_reaction(channel, opt_ts, r)
-            except Exception:
-                pass
-            resp = _wait_for_user_response(
-                channel,
-                opt_ts,
-                {"1": ["one", "keycap_1"], "2": ["two", "keycap_2"], "3": ["three", "keycap_3"]},
-                timeout_sec=1800,
-            )
-            if resp in {"1", "2", "3"}:
-                choice = int(resp)
-                text = tweets[choice - 1]
-                try:
-                    track_user_choice(choice, text)
-                except Exception:
-                    pass
-                tid = post_to_x(text)
-                slack_post(channel, f"✅ Posted morning tweet (id={tid})")
-        elif action["type"] == "reply" and action.get("tweet_id"):
-            body = f"Target: @{action.get('user')}\nWhy: {action.get('summary')}\nDraft reply? 👍 yes · 👎 skip · ⏭️ next"
-            ts = _post_action_card(channel, idx, total, "REPLY TO HIGH-VALUE POST", body)
-            try:
-                for r in ("+1", "thumbsdown", "next_track_button"):
-                    slack_add_reaction(channel, ts, r)
-            except Exception:
-                pass
-            resp = _wait_for_user_response(
-                channel,
-                ts,
-                {"yes": ["+1", "thumbsup"], "no": ["thumbsdown"], "next": ["next_track_button"]},
-                timeout_sec=1800,
-            )
-            if resp != "yes":
-                continue
-            # Generate one draft on demand
-            try:
-                client = twitter_client_v2()
-                tw = client.get_tweet(id=action["tweet_id"], tweet_fields=["text"]).data
-                source_text = getattr(tw, "text", action.get("summary", ""))
-                draft = _generate_reply_single(source_text, action.get("user") or "user")
-            except Exception as e:
-                slack_post(channel, f"{COACH_TAG} Failed to generate draft: {e}")
-                continue
-            draft_text = f"Draft:\n{draft}\n\nReact ✅ to post · ✏️ to edit (reply 'edit: ...') · 🔄 to regenerate · 👎 to skip"
-            _, dts = slack_post(channel, draft_text)
-            try:
-                for r in ("white_check_mark", "pencil2", "arrows_counterclockwise", "thumbsdown"):
-                    slack_add_reaction(channel, dts, r)
-            except Exception:
-                pass
-            resp = _wait_for_user_response(
-                channel,
-                dts,
-                {
-                    "post": ["white_check_mark", "heavy_check_mark"],
-                    "edit": ["pencil2"],
-                    "regen": ["arrows_counterclockwise"],
-                    "skip": ["thumbsdown"],
-                },
-                timeout_sec=1800,
-            )
-            if resp == "edit":
-                # Look for a thread reply starting with 'edit:'
-                edits = slack_thread_replies(channel, dts, limit=50)
-                for r in edits[::-1]:
-                    t = (r.get("text") or "").strip()
-                    if t.lower().startswith("edit:"):
-                        draft = t.split(":", 1)[1].strip()
-                        break
-                resp = "post"
-            if resp == "regen":
-                draft = _generate_reply_single(source_text, action.get("user") or "user")
-                slack_post(channel, f"Regenerated:\n{draft}")
-                resp = "post"
-            if resp == "post":
-                rid = reply_to_tweet(action["tweet_id"], draft, handle=action.get("user"))
-                slack_post(channel, f"✅ Posted reply (id={rid}) to @{action.get('user')}")
+    resp = _wait_for_user_response(
+        channel,
+        opt_ts,
+        {"1": ["one", "keycap_1"], "2": ["two", "keycap_2"], "3": ["three", "keycap_3"]},
+        timeout_sec=1800,
+    )
+
+    if resp in {"1", "2", "3"}:
+        choice = int(resp)
+        text = tweets[choice - 1]
+        try:
+            track_user_choice(choice, text)
+        except Exception:
+            pass
+        tid = post_to_x(text)
+        slack_post(channel, f"✅ Posted morning tweet (id={tid})")
+    else:
+        slack_post(channel, "⏭️ Skipped tweet posting")
+        return
+
+    # STEP 2: Show 10 reply opportunities
+    slack_post(channel, "\n**STEP 2: Reply opportunities**\n\nFetching high-value posts...")
+    try:
+        opps_pairs = _fetch_opportunities()
+        opps = [o for o, _ in opps_pairs][:10]
+    except Exception as e:
+        slack_post(channel, f"❌ Error fetching opportunities: {e}")
+        return
+
+    if not opps:
+        slack_post(channel, "No reply opportunities found")
+        return
+
+    lines = []
+    for i, o in enumerate(opps, 1):
+        lines.append(f"{i}. @{o.user} — {o.summary} (score {o.score})")
+
+    opp_text = "\n".join(lines) + "\n\nReply with numbers to generate drafts (e.g., '1 3 5')"
+    slack_post(channel, opp_text)
 
     slack_post(channel, "🎉 MORNING SESSION COMPLETE — see you at 14:00 CET")
 
